@@ -18,7 +18,7 @@ interface Props {
 }
 
 export default function TypingTest({ passage, durationMs, label, onFinish }: Props) {
-  const phase = "active"; 
+  const { phase } = useProctor();
   const [typed, setTyped] = useState("");
   const [remaining, setRemaining] = useState(durationMs);
 
