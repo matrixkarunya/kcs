@@ -12,6 +12,7 @@ import {
 } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import AppHeader from "@/components/app-header";
+import Link from "next/link";
 
 interface Student {
   id: string;
@@ -65,11 +66,16 @@ export default function AdminPage() {
       <AppHeader title="Admin" />
       <main className="mx-auto max-w-4xl space-y-6 p-6">
         <section className="rounded-xl border border-slate-200 bg-white p-5">
-          <h2 className="font-semibold text-[#101828]">Events</h2>
-          <p className="mt-1 text-sm text-slate-600">
-            Typing, Code Relay and Prompt Challenge controls will go here.
-          </p>
-        </section>
+  <h2 className="font-semibold text-[#101828]">Events</h2>
+  <div className="mt-3 flex gap-3">
+    <Link
+      href="/admin/typing"
+      className="rounded-md bg-teal-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-teal-800"
+    >
+      Typing
+    </Link>
+  </div>
+</section>
 
         <section className="rounded-xl border border-slate-200 bg-white p-5">
           <h2 className="font-semibold text-[#101828]">
