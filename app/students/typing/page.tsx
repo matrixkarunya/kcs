@@ -152,29 +152,33 @@ export default function TypingPage() {
   }, [needTick]);
 
   const begin = useCallback(async () => {
-    if (beginning.current || !roundId) return;
-    beginning.current = true;
-    setError("");
-    try {
-      const r = await api<{ passage: string; durationSec: number }>(
-        "/api/typing/begin",
-        { roundId }
-      );
-      setSession({ passage: r.passage, durationSec: r.durationSec });
-      setAttempt("started");
-    } catch (e) {
-      const err = e as { status?: number; message?: string };
-      if (err.status === 425) {
-        await new Promise((res) => setTimeout(res, 600));
-        beginning.current = false;
-        return begin();
-      }
-      if (err.message === "already-attempted") setAttempt("started");
-      else if (err.message === "round-not-running") setError("This round is not open.");
-      else setError("Could not start your test. Tell an organiser.");
+  if (beginning.current || !roundId) return;
+  beginning.current = true;
+  setError("");
+  try {
+    const r = await api<{ passage: string; durationSec: number }>(
+      "/api/typing/begin",
+      { roundId }
+    );
+    setSession({ passage: r.passage, durationSec: r.durationSec });
+    setAttempt("started");
+  } catch (e) {
+    const err = e as { status?: number; message?: string };
+    if (err.status === 425) {
+      await new Promise((res) => setTimeout(res, 600));
       beginning.current = false;
+      return begin();
     }
-  }, [roundId]);
+    if (err.message === "already-attempted") {
+      setAttempt("started");
+    } else if (err.message === "round-not-running") {
+      setError("This round is not open.");
+    } else {
+      setError(`Could not start (${err.status ?? "?"}: ${err.message}). Tell an organiser.`);
+    }
+    // beginning.current stays true on failure so the 100ms tick can't re-fire it
+  }
+}, [roundId]);
 
   // synced start: begin automatically when the countdown ends
   useEffect(() => {
