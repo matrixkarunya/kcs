@@ -38,6 +38,7 @@ const EVENTS: EventItem[] = [
   {
     name: "Code Relay",
     blurb: "Pass the baton and solve problems as a team.",
+    href: "/students/relay",
     icon: (
       <svg {...iconProps}>
         <path d="m16 18 6-6-6-6M8 6l-6 6 6 6" />
