@@ -30,12 +30,14 @@ interface Team {
   order: string[];
   qIndex: number;
   holder: number;
+  startedAt?: Timestamp | null;
   legStartedAt: Timestamp | null;
   solved: number;
   wrong: number;
   skipped?: number;
   bonusMs?: number;
   judgingSince?: Timestamp | null;
+  handoffSince?: Timestamp | null;
   memberCounts?: number[];
   endedEarly?: boolean;
   status: "waiting" | "active" | "finished";
@@ -46,7 +48,7 @@ interface TestResult {
   ok: boolean;
   error: string | null;
 }
-type Busy = "" | "run" | "check" | "submit" | "pass" | "skip" | "end";
+type Busy = "" | "run" | "check" | "submit" | "pass" | "skip" | "end" | "begin" | "takeover";
 
 const PAUSE_CAP = 60_000; // must match the server
 const DEFAULT_CAP = 5;
@@ -99,6 +101,10 @@ export default function RelayPage() {
   const [awaitNext, setAwaitNext] = useState(false); // waiting for the next question to show
   const [confirmSkip, setConfirmSkip] = useState(false);
   const [confirmEnd, setConfirmEnd] = useState(false);
+  const [agreed, setAgreed] = useState(false); // instructions checkbox
+  // Clock freeze (server time) applied the instant a baton pass starts, before the
+  // server answers, so no time leaks while the request is in flight.
+  const [localFreeze, setLocalFreeze] = useState<number | null>(null);
 
   const taRef = useRef<HTMLTextAreaElement>(null);
   const passedFor = useRef(0);
@@ -155,6 +161,13 @@ export default function RelayPage() {
     return () => clearTimeout(t);
   }, [notice]);
 
+  const handoffSinceMs = team?.handoffSince?.toMillis() ?? 0;
+
+  // the server state has caught up: drop the local freeze
+  useEffect(() => {
+    setLocalFreeze(null);
+  }, [handoffSinceMs, team?.status]);
+
   const resume = () => {
     if (teamId) api("/api/relay", { action: "resume", teamId }).catch(() => {});
   };
@@ -172,35 +185,47 @@ export default function RelayPage() {
 
   // ---------- derived ----------
   const serverNow = now + offset;
-  // While the server has a pause running, the clock stands still at the pause start.
+  const handoffRaw = handoffSinceMs > 0;
+  // Judging pause: the clock stands still at the pause start.
   const pausedSince = team?.judgingSince?.toMillis() ?? 0;
-  const paused = !!pausedSince && serverNow - pausedSince < PAUSE_CAP;
-  const effNow = pausedSince
-    ? serverNow - pausedSince < PAUSE_CAP
-      ? pausedSince
-      : serverNow - PAUSE_CAP
-    : serverNow;
+  const paused = !handoffRaw && !!pausedSince && serverNow - pausedSince < PAUSE_CAP;
 
+  // Effective clock. Priority: baton handoff > local freeze (pass in flight) > judging pause.
+  let effNow = serverNow;
+  if (handoffRaw) {
+    effNow = handoffSinceMs;
+  } else if (localFreeze !== null) {
+    effNow = localFreeze;
+  } else if (pausedSince) {
+    effNow = serverNow - pausedSince < PAUSE_CAP ? pausedSince : serverNow - PAUSE_CAP;
+  }
+
+  const teamStartMs = team?.startedAt?.toMillis() ?? 0;
+  const started = teamStartMs > 0;
   const bonus = team?.bonusMs ?? 0;
-  const endsAt =
-    running && cfg?.startedAt ? cfg.startedAt.toMillis() + cfg.durationMin * 60_000 + bonus : 0;
+  // each team has its own clock, starting when it pressed "Start relay"
+  const endsAt = running && started && cfg ? teamStartMs + cfg.durationMin * 60_000 + bonus : 0;
   const timeUp = running && endsAt > 0 && effNow >= endsAt;
   const total = team?.order.length ?? 0;
   const finished =
     !!team && (team.status === "finished" || (total > 0 && team.qIndex >= total));
-  const arena = running && !!team && team.status === "active" && !finished && !timeUp;
+  const arena =
+    running && !!team && started && team.status === "active" && !finished && !timeUp;
   const legStartMs = team?.legStartedAt?.toMillis() ?? 0;
 
-  const handoffMsLeft = arena && legStartMs > effNow ? legStartMs - effNow : 0;
-  const handoff = handoffMsLeft > 0;
+  const handoff = arena && handoffRaw;
+  const clockStopped = paused || handoff || localFreeze !== null;
 
   const legMsLeft =
     arena && cfg && legStartMs
-      ? Math.min(cfg.legSec * 1000, legStartMs + cfg.legSec * 1000 - effNow)
+      ? handoff
+        ? cfg.legSec * 1000
+        : Math.min(cfg.legSec * 1000, legStartMs + cfg.legSec * 1000 - effNow)
       : null;
   const totalMsLeft = endsAt - effNow;
-  const passMsLeft = arena && cfg && legStartMs ? legStartMs + cfg.minPassSec * 1000 - effNow : null;
-  const expired = !paused && legMsLeft !== null && legMsLeft <= 0;
+  const passMsLeft =
+    arena && cfg && legStartMs && !handoff ? legStartMs + cfg.minPassSec * 1000 - effNow : null;
+  const expired = !paused && !handoff && legMsLeft !== null && legMsLeft <= 0;
 
   const nMembers = team?.memberNames.length ?? 0;
   const cap = cfg?.maxPerMember ?? DEFAULT_CAP;
@@ -258,16 +283,18 @@ export default function RelayPage() {
 
   // automatic baton pass when the turn time runs out
   useEffect(() => {
-    if (!expired || !teamId || !arena || legStartMs === 0) return;
+    if (!expired || !teamId || !arena || legStartMs === 0 || !cfg) return;
     if (passedFor.current === legStartMs) return;
     passedFor.current = legStartMs;
+    // freeze both clocks at the exact end of the turn, not at "now"
+    setLocalFreeze(legStartMs + cfg.legSec * 1000);
     api("/api/relay", { action: "pass", mode: "timeout", teamId }).catch(() => {
       setTimeout(() => {
         passedFor.current = 0;
         setRetry((n) => n + 1);
       }, 3000);
     });
-  }, [expired, legStartMs, teamId, arena, retry]);
+  }, [expired, legStartMs, teamId, arena, retry]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---------- editor ----------
   function setBoth(next: string) {
@@ -307,19 +334,34 @@ export default function RelayPage() {
       case "time-up":
         return "Time is up.";
       case "handoff":
-        return "Wait for the seat swap to finish.";
+        return "The baton is being passed. Wait for the next member to take it.";
       case "member-done":
         return "This member has used all their questions. Pass the baton.";
       case "too-soon":
         return "It is too early to pass the baton.";
       case "no-next":
         return "No other member has questions left.";
+      case "not-begun":
+        return "Start the relay first.";
       default:
         return fallback;
     }
   };
 
   // ---------- actions ----------
+  // Start relay: the team's own clock starts now
+  async function onBegin() {
+    if (busy || !teamId || !agreed) return;
+    setBusy("begin");
+    setNotice(null);
+    try {
+      await api("/api/relay", { action: "begin", teamId });
+    } catch (e) {
+      setNotice({ kind: "bad", text: errText(e, "Could not start the relay. Try again.") });
+    }
+    setBusy("");
+  }
+
   // Run: your own input, unlimited, nothing stored, clock keeps running
   async function onRun() {
     if (busy || !question) return;
@@ -443,13 +485,33 @@ export default function RelayPage() {
     if (!waitForNext) afterPaint(resume);
   }
 
+  // Pass the baton: both clocks freeze at the click, before the server even answers
   async function onPass() {
     if (busy || !teamId) return;
     setBusy("pass");
+    setLocalFreeze(Date.now() + offset);
     try {
-      await api("/api/relay", { action: "pass", mode: "early", teamId });
+      const r = await api<{ ok: boolean; noop?: boolean }>("/api/relay", {
+        action: "pass",
+        mode: "early",
+        teamId,
+      });
+      if (r?.noop) setLocalFreeze(null);
     } catch (e) {
+      setLocalFreeze(null);
       setNotice({ kind: "bad", text: errText(e, "Could not pass the baton yet.") });
+    }
+    setBusy("");
+  }
+
+  // The next member sits down and takes the baton: clocks start again
+  async function onTakeover() {
+    if (busy || !teamId) return;
+    setBusy("takeover");
+    try {
+      await api("/api/relay", { action: "takeover", teamId });
+    } catch (e) {
+      setNotice({ kind: "bad", text: errText(e, "Could not take the baton. Try again.") });
     }
     setBusy("");
   }
@@ -494,7 +556,7 @@ export default function RelayPage() {
         <p className="mx-auto mt-4 max-w-md text-sm text-slate-600">
           {cfg.name}: {cfg.durationMin} minutes in total, {Math.round((cfg.legSec / 60) * 10) / 10}{" "}
           minutes per turn, at most {cap} questions per member. Sit down in the order above and wait
-          for the organiser to start.
+          for the organiser to open the round.
         </p>
       </div>
     );
@@ -554,6 +616,84 @@ export default function RelayPage() {
         )}
       </>
     );
+  } else if (!started) {
+    // ---------- instructions: the question stays hidden until the team starts ----------
+    const legMin = Math.round((cfg.legSec / 60) * 10) / 10;
+    body = (
+      <div className={`${card} mx-auto max-w-3xl`}>
+        <p className="text-xs font-semibold uppercase tracking-widest text-teal-700">Instructions</p>
+        <h2 className="mt-1 text-2xl font-bold text-slate-900">{team.name}</h2>
+        <p className="text-sm text-slate-600">{cfg.name}</p>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          {team.memberNames.map((m, i) => (
+            <span key={m} className="rounded-full bg-teal-50 px-3 py-1 text-sm font-medium text-teal-900">
+              {i + 1}. {m}
+            </span>
+          ))}
+        </div>
+
+        <ul className="mt-5 list-disc space-y-2 pl-5 text-[15px] leading-relaxed text-slate-700">
+          <li>
+            Your team has <b>{cfg.durationMin} minutes</b> in total. Your clock starts only when you
+            press <b>Start relay</b> below. You can start whenever you are ready.
+          </li>
+          <li>
+            Members code one after another, in the order shown above. Each member gets{" "}
+            <b>{legMin} minutes</b> per turn and at most <b>{cap} questions</b>.
+          </li>
+          <li>
+            A member can pass the baton early after {Math.round(cfg.minPassSec)} seconds, or at once
+            after using all {cap} questions. When the turn time runs out the baton is passed
+            automatically.
+          </li>
+          <li>
+            When the baton is passed, <b>both clocks stop</b>. They start again only when the next
+            member sits down and presses <b>Take the baton</b>.
+          </li>
+          <li>
+            <b>Run</b> and <b>Check tests</b> are free. Only <b>Submit</b> is scored, and every wrong
+            submit is counted. Your program is also tested on hidden values, so it must work for any
+            valid input.
+          </li>
+          <li>
+            The clock pauses while your code is being judged and until the next question is showing.
+          </li>
+          <li>
+            <b>Skip question</b> moves forward for good. A skipped question cannot be opened again and
+            it counts as one of that member&apos;s {cap} questions.
+          </li>
+          <li>
+            <b>End section</b> stops your team permanently and cannot be undone.
+          </li>
+        </ul>
+
+        <label className="mt-6 flex cursor-pointer items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-800">
+          <input
+            type="checkbox"
+            checked={agreed}
+            onChange={(e) => setAgreed(e.target.checked)}
+            className="mt-0.5 h-4 w-4 accent-teal-700"
+          />
+          <span>I have read and understood the instructions. My team is seated in the order above.</span>
+        </label>
+
+        {notice && (
+          <p
+            role="status"
+            className="mt-4 rounded-lg bg-amber-50 p-3 text-sm font-medium text-amber-900"
+          >
+            {notice.text}
+          </p>
+        )}
+
+        <div className="mt-5 flex justify-end">
+          <button className={btn} onClick={onBegin} disabled={!agreed || !!busy}>
+            {busy === "begin" ? "Starting…" : "Start relay"}
+          </button>
+        </div>
+      </div>
+    );
   } else if (!question) {
     body = (
       <div className="flex flex-col items-center gap-3 py-24 text-sm text-slate-600">
@@ -590,7 +730,7 @@ export default function RelayPage() {
             </div>
             <div className="text-right">
               <p className="text-xs text-slate-500">
-                {paused ? "Round time (clock paused)" : "Round time left"}
+                {clockStopped ? "Round time (clock paused)" : "Round time left"}
               </p>
               <p
                 className={`font-mono text-2xl font-bold tabular-nums ${
@@ -621,7 +761,9 @@ export default function RelayPage() {
             </div>
             <div className="flex items-center gap-5">
               <div className="text-right">
-                <p className="text-xs text-slate-500">{paused ? "Turn (paused)" : "Turn ends in"}</p>
+                <p className="text-xs text-slate-500">
+                  {clockStopped ? "Turn (paused)" : "Turn ends in"}
+                </p>
                 <p
                   className={`font-mono text-3xl font-bold tabular-nums ${
                     lowLeg ? "text-red-600" : "text-slate-900"
@@ -675,7 +817,7 @@ export default function RelayPage() {
               <p className="mt-4 text-lg text-teal-100">
                 {isLast
                   ? "You are the last member. Finishing ends the section for your team."
-                  : `Pass the baton so ${nextName} can start.`}
+                  : `Pass the baton so ${nextName} can start. Both clocks stop until they take it.`}
               </p>
               <button
                 onClick={onPass}
@@ -870,16 +1012,25 @@ export default function RelayPage() {
           </div>
         )}
 
-        {/* seat swap overlay */}
+        {/* baton handoff overlay: both clocks are stopped until the next member takes the baton */}
         {handoff && (
           <div className="fixed inset-0 z-[60] flex items-center justify-center bg-teal-900/95 px-4 text-center text-white">
-            <div>
-              <p className="text-sm font-semibold uppercase tracking-[0.3em] text-teal-200">Swap seats</p>
-              <p className="mt-4 text-4xl font-bold sm:text-5xl">{holderName} is up next</p>
-              <p className="mt-10 font-mono text-[9rem] font-bold leading-none tabular-nums sm:text-[12rem]">
-                {Math.ceil(handoffMsLeft / 1000)}
+            <div className="max-w-xl">
+              <p className="text-sm font-semibold uppercase tracking-[0.3em] text-teal-200">
+                Baton passed
               </p>
-              <p className="mt-6 text-teal-100">The editor opens when the countdown ends.</p>
+              <p className="mt-4 text-4xl font-bold sm:text-5xl">{holderName} is up next</p>
+              <p className="mt-4 text-lg text-teal-100">
+                Swap seats now. Both timers are stopped. They start again when {holderName} takes
+                the baton.
+              </p>
+              <button
+                onClick={onTakeover}
+                disabled={!!busy}
+                className="mt-10 rounded-2xl bg-white px-10 py-5 text-2xl font-bold text-teal-900 shadow-2xl transition hover:bg-teal-50 disabled:opacity-60"
+              >
+                {busy === "takeover" ? "Starting…" : "Take the baton"}
+              </button>
             </div>
           </div>
         )}

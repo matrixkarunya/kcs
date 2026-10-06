@@ -7,8 +7,7 @@ import { normalizeOutput } from "@/lib/relay";
 
 export const dynamic = "force-dynamic";
 
-const HANDOFF_MS = 5000; // pause between one member and the next
-const MAX_PAUSE_MS = 60_000; // longest single pause we will credit
+const MAX_PAUSE_MS = 60_000; // longest single judging pause we will credit
 const DEFAULT_CAP = 5; // questions per member
 
 interface Team {
@@ -17,12 +16,14 @@ interface Team {
   order: string[];
   qIndex: number;
   holder: number;
+  startedAt?: Timestamp | null; // when THIS team pressed "Start relay"
   legStartedAt: Timestamp | null;
   solved: number;
   wrong: number;
   skipped?: number;
-  bonusMs?: number; // time credited back (pauses + handoffs)
-  judgingSince?: Timestamp | null; // a pause is running since this moment
+  bonusMs?: number; // time credited back (judging pauses + handoffs)
+  judgingSince?: Timestamp | null; // a judging pause is running since this moment
+  handoffSince?: Timestamp | null; // baton handoff: everything is frozen since this moment
   memberCounts?: number[]; // questions each member has used (solved or skipped)
   endedEarly?: boolean;
   status: "waiting" | "active" | "finished";
@@ -43,13 +44,13 @@ interface TokenPayload {
   iat: number;
 }
 
-// How much of the running pause counts (capped).
+// How much of the running judging pause counts (capped).
 const pendingOf = (t: Team, now: number) => {
   const since = t.judgingSince?.toMillis();
   return since ? Math.max(0, Math.min(now - since, MAX_PAUSE_MS)) : 0;
 };
 
-// Folds a running pause into the permanent fields and clears it.
+// Folds a running judging pause into the permanent fields and clears it.
 function settle(cur: Team, now: number): Record<string, unknown> {
   const pause = pendingOf(cur, now);
   const upd: Record<string, unknown> = { judgingSince: null };
@@ -89,9 +90,32 @@ export async function POST(req: Request) {
       throw new ApiError(409, "round-not-running");
     }
     const now = Date.now();
+
+    // ---------- begin: the team accepted the instructions, its own clock starts now ----------
+    if (action === "begin") {
+      await db.runTransaction(async (tx) => {
+        const cur = (await tx.get(teamRef)).data() as Team;
+        if (cur.startedAt) return; // already started (double click / reload)
+        if (cur.status === "finished") throw new ApiError(409, "team-not-active");
+        tx.update(teamRef, {
+          startedAt: Timestamp.fromMillis(now),
+          legStartedAt: Timestamp.fromMillis(now),
+          status: "active",
+          bonusMs: 0,
+          judgingSince: null,
+          handoffSince: null,
+        });
+      });
+      return NextResponse.json({ ok: true });
+    }
+
+    const teamStart = team.startedAt?.toMillis() ?? null;
+    if (teamStart === null) throw new ApiError(409, "not-begun");
+
     const pending = pendingOf(team, now);
+    const handoffPause = team.handoffSince ? Math.max(0, now - team.handoffSince.toMillis()) : 0;
     const deadline =
-      cfg.startedAt.toMillis() + cfg.durationMin * 60_000 + (team.bonusMs ?? 0) + pending;
+      teamStart + cfg.durationMin * 60_000 + (team.bonusMs ?? 0) + pending + handoffPause;
     if (now > deadline + 3000) throw new ApiError(409, "time-up");
     if (team.status !== "active") throw new ApiError(409, "team-not-active");
 
@@ -101,7 +125,7 @@ export async function POST(req: Request) {
 
     const qid = team.order[team.qIndex];
     const legStart = (team.legStartedAt?.toMillis() ?? now) + pending;
-    const inHandoff = legStart > now; // next member's turn has not begun yet
+    const inHandoff = !!team.handoffSince; // baton is waiting for the next member
 
     // ---------- resume: the screen is showing, the clock may run again ----------
     if (action === "resume") {
@@ -113,12 +137,33 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true });
     }
 
+    // ---------- takeover: the next member pressed the button, clocks start again ----------
+    if (action === "takeover") {
+      await db.runTransaction(async (tx) => {
+        const cur = (await tx.get(teamRef)).data() as Team;
+        if (!cur.handoffSince || cur.status !== "active") return;
+        const pause = Math.max(0, now - cur.handoffSince.toMillis());
+        tx.update(teamRef, {
+          handoffSince: null,
+          judgingSince: null,
+          bonusMs: (cur.bonusMs ?? 0) + pause, // the whole handoff is credited back
+          legStartedAt: Timestamp.fromMillis(now), // fresh turn for the new member
+        });
+      });
+      return NextResponse.json({ ok: true });
+    }
+
     // ---------- end the section for good ----------
     if (action === "end") {
       await db.runTransaction(async (tx) => {
         const cur = (await tx.get(teamRef)).data() as Team;
         if (cur.status !== "active") throw new ApiError(409, "team-not-active");
-        tx.update(teamRef, { status: "finished", endedEarly: true, judgingSince: null });
+        tx.update(teamRef, {
+          status: "finished",
+          endedEarly: true,
+          judgingSince: null,
+          handoffSince: null,
+        });
       });
       return NextResponse.json({ ok: true });
     }
@@ -133,6 +178,7 @@ export async function POST(req: Request) {
           throw new ApiError(409, "too-soon");
         }
       } else if (mode === "timeout") {
+        if (inHandoff) return NextResponse.json({ ok: true, noop: true });
         if (now < legStart + cfg.legSec * 1000 - 500) {
           return NextResponse.json({ ok: true, noop: true });
         }
@@ -142,21 +188,31 @@ export async function POST(req: Request) {
 
       const result = await db.runTransaction(async (tx) => {
         const cur = (await tx.get(teamRef)).data() as Team;
+        if (cur.handoffSince) return "stale";
         if (cur.legStartedAt?.toMillis() !== team.legStartedAt?.toMillis()) return "stale";
 
         const next = cur.holder + 1;
+        const s = settle(cur, now); // credit any running judging pause first
+        const settledLegStart =
+          (s.legStartedAt as Timestamp | undefined)?.toMillis() ??
+          cur.legStartedAt?.toMillis() ??
+          now;
 
         // the last member's turn is over (time, cap or early finish): the team is done
         if (next >= Math.max(1, cur.memberNames.length)) {
-          tx.update(teamRef, { status: "finished", judgingSince: null });
+          tx.update(teamRef, { ...s, status: "finished", handoffSince: null });
           return "ok";
         }
 
+        // Freeze the clocks at the moment the turn really ended. For a timeout that is
+        // the end of the turn, not "now", so network delay never costs the team time.
+        const legEnd = settledLegStart + cfg.legSec * 1000;
+        const frozenAt = mode === "timeout" ? Math.min(now, legEnd) : now;
+
         tx.update(teamRef, {
+          ...s,
           holder: next,
-          legStartedAt: Timestamp.fromMillis(now + HANDOFF_MS),
-          bonusMs: (cur.bonusMs ?? 0) + pendingOf(cur, now) + HANDOFF_MS,
-          judgingSince: null,
+          handoffSince: Timestamp.fromMillis(frozenAt),
         });
         return "ok";
       });
@@ -175,6 +231,7 @@ export async function POST(req: Request) {
         if (cur.qIndex !== team.qIndex || cur.status !== "active") {
           throw new ApiError(409, "stale-submit");
         }
+        if (cur.handoffSince) throw new ApiError(409, "handoff");
         const cs = countsOf(cur);
         if (cs[cur.holder] >= cap) throw new ApiError(409, "member-done");
         cs[cur.holder] += 1;
@@ -278,6 +335,7 @@ export async function POST(req: Request) {
         if (cur.qIndex !== team.qIndex || cur.wrong !== team.wrong || cur.status !== "active") {
           throw new ApiError(409, "stale-submit");
         }
+        if (cur.handoffSince) throw new ApiError(409, "handoff");
         const pause = cur.judgingSince ?? Timestamp.fromMillis(now);
         if (!ok) {
           tx.update(teamRef, { wrong: cur.wrong + 1, judgingSince: pause });
