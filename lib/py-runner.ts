@@ -1,62 +1,117 @@
-export interface RunResult {
+export interface PyResult {
   output: string;
   error: string | null;
-  timedOut?: boolean;
 }
+
+// Bump the number after ?v= whenever you change relay-worker.js.
+// It forces the browser to drop any cached (old classic) worker.
+const WORKER_URL = "/relay-worker.js?v=3";
 
 let worker: Worker | null = null;
-let ready: Promise<void> | null = null;
+let workerReady: Promise<Worker> | null = null;
 let nextId = 1;
-const pending = new Map<number, (r: RunResult[]) => void>();
+// Runs are serialized: one Python job at a time on the single worker.
+let chain: Promise<unknown> = Promise.resolve();
 
-function boot() {
-  const w = new Worker("/relay-worker.js");
+function resetWorker(w?: Worker) {
+  if (w && w !== worker) return;
+  worker?.terminate();
+  worker = null;
+  workerReady = null;
+}
+
+function getWorker(): Promise<Worker> {
+  if (workerReady) return workerReady;
+
+  const w = new Worker(WORKER_URL, { type: "module" });
   worker = w;
-  ready = new Promise<void>((resolve) => {
-    w.onmessage = (e: MessageEvent) => {
+
+  workerReady = new Promise<Worker>((resolve, reject) => {
+    const cleanup = () => {
+      w.removeEventListener("message", onMessage);
+      w.removeEventListener("error", onError);
+    };
+    const onMessage = (e: MessageEvent) => {
       const d = e.data;
-      if (d.type === "ready" || d.type === "fatal") resolve();
-      else if (d.type === "done") {
-        pending.get(d.id)?.(d.results);
-        pending.delete(d.id);
+      if (d?.type === "ready") {
+        cleanup();
+        resolve(w);
+      } else if (d?.type === "fatal") {
+        cleanup();
+        resetWorker(w);
+        reject(new Error(d.message || "Pyodide failed to load"));
       }
     };
+    const onError = (e: ErrorEvent) => {
+      cleanup();
+      resetWorker(w);
+      reject(new Error(e.message || "Worker failed to start (check /pyodide/pyodide.mjs loads)"));
+    };
+    w.addEventListener("message", onMessage);
+    w.addEventListener("error", onError);
   });
+
+  return workerReady;
 }
 
-// Start loading Python early so the first Run is quick.
-export function warmUpPython() {
-  if (!worker) boot();
+function allFail(inputs: string[], error: string): PyResult[] {
+  return inputs.map(() => ({ output: "", error }));
 }
 
-export async function runPython(
-  code: string,
-  inputs: string[],
-  timeoutMs = 8000
-): Promise<RunResult[]> {
-  if (!worker) boot();
-  await ready;
-  const w = worker!;
-  return new Promise((resolve) => {
+async function runOnce(code: string, inputs: string[], timeoutMs: number): Promise<PyResult[]> {
+  let w: Worker;
+  try {
+    // Loading Pyodide is not counted against the time limit.
+    w = await getWorker();
+  } catch (err) {
+    const m = err instanceof Error ? err.message : String(err);
+    return allFail(inputs, `Python could not start: ${m}`);
+  }
+
+  return new Promise<PyResult[]>((resolve) => {
     const id = nextId++;
-    const timer = setTimeout(() => {
-      pending.delete(id);
-      w.terminate();
-      worker = null;
-      ready = null;
-      resolve(
-        inputs.map(() => ({
-          output: "",
-          error: "Your program ran for too long. Check for a loop that never ends.",
-          timedOut: true,
-        }))
-      );
-      boot(); // restart in the background
-    }, timeoutMs);
-    pending.set(id, (r) => {
+
+    const finish = (results: PyResult[]) => {
       clearTimeout(timer);
-      resolve(r);
-    });
+      w.removeEventListener("message", onMessage);
+      w.removeEventListener("error", onError);
+      resolve(results);
+    };
+
+    const onMessage = (e: MessageEvent) => {
+      const d = e.data;
+      if (d?.type === "done" && d.id === id) finish(d.results as PyResult[]);
+    };
+
+    const onError = (e: ErrorEvent) => {
+      resetWorker(w);
+      finish(allFail(inputs, `Python worker crashed: ${e.message || "unknown error"}`));
+    };
+
+    // Python runs synchronously inside the worker, so the only way to stop an
+    // infinite loop is to kill the worker. A fresh one is created on the next run.
+    const timer = setTimeout(() => {
+      resetWorker(w);
+      finish(allFail(inputs, "Time limit exceeded"));
+    }, timeoutMs);
+
+    w.addEventListener("message", onMessage);
+    w.addEventListener("error", onError);
     w.postMessage({ id, code, inputs });
   });
+}
+
+/**
+ * Runs `code` once per entry in `inputs` (each entry is the full stdin text).
+ * Returns one { output, error } per input, in order.
+ * `timeoutMs` applies to the whole call, excluding Pyodide startup.
+ */
+export function runPython(
+  code: string,
+  inputs: string[],
+  timeoutMs = 10000
+): Promise<PyResult[]> {
+  const job = chain.then(() => runOnce(code, inputs, timeoutMs));
+  chain = job.catch(() => undefined);
+  return job;
 }
