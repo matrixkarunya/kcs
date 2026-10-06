@@ -1,16 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   collection,
   doc,
-  getDoc,
   getDocs,
   onSnapshot,
   query,
-  serverTimestamp,
-  setDoc,
   Timestamp,
   where,
 } from "firebase/firestore";
@@ -34,7 +31,6 @@ interface Cfg {
 }
 interface Team {
   name: string;
-  memberUids: string[];
   memberNames: string[];
   order: string[];
   qIndex: number;
@@ -45,6 +41,11 @@ interface Team {
   status: "waiting" | "active" | "finished";
 }
 type Question = PublicQuestion & { index: number; total: number };
+interface TestResult {
+  label: string;
+  ok: boolean;
+  error: string | null;
+}
 
 const fmt = (ms: number) => {
   const s = Math.max(0, Math.ceil(ms / 1000));
@@ -70,19 +71,22 @@ export default function RelayPage() {
   const [question, setQuestion] = useState<Question | null>(null);
   const [code, setCode] = useState("");
   const [inputText, setInputText] = useState("");
-  const [runOut, setRunOut] = useState<{ output: string; error: string | null } | null>(null);
-  const [busy, setBusy] = useState<"" | "run" | "submit" | "pass">("");
+  const [runOut, setRunOut] = useState<{
+    output: string;
+    error: string | null;
+    sampleMatch: boolean | null;
+  } | null>(null);
+  const [checkResults, setCheckResults] = useState<TestResult[] | null>(null);
+  const [busy, setBusy] = useState<"" | "run" | "check" | "submit" | "pass">("");
   const [notice, setNotice] = useState<{ kind: "ok" | "bad"; text: string } | null>(null);
+  const [handoffUntil, setHandoffUntil] = useState(0);
   const [retry, setRetry] = useState(0);
 
   const taRef = useRef<HTMLTextAreaElement>(null);
-  const codeRef = useRef("");
-  const lastSaved = useRef("");
   const passedFor = useRef(0);
-  const ctx = useRef({ teamId: null as string | null | undefined, qid: "", roundId: "", isHolder: false });
+  const prevHolder = useRef<number | null>(null);
 
   const running = cfg?.status === "running";
-  const isHolder = !!team && !!uid && team.memberUids[team.holder] === uid;
 
   // ---------- data ----------
   useEffect(
@@ -104,9 +108,10 @@ export default function RelayPage() {
       .catch(() => {});
   }, []);
 
+  // one login = one team
   useEffect(() => {
     if (!uid) return;
-    getDocs(query(collection(db, "relayTeams"), where("memberUids", "array-contains", uid)))
+    getDocs(query(collection(db, "relayTeams"), where("uid", "==", uid)))
       .then((s) => setTeamId(s.empty ? null : s.docs[0].id))
       .catch(() => setTeamId(null));
   }, [uid]);
@@ -139,9 +144,12 @@ export default function RelayPage() {
   const passMsLeft =
     arena && cfg && legStartMs ? legStartMs + cfg.minPassSec * 1000 - serverNow : null;
   const expired = legMsLeft !== null && legMsLeft <= 0;
-  const myIndex = team && uid ? team.memberUids.indexOf(uid) : -1;
+  const handoff = handoffUntil > now;
+  const nMembers = team?.memberNames.length ?? 0;
+  const holderName = team?.memberNames[team.holder] ?? "";
+  const nextName = team ? team.memberNames[(team.holder + 1) % Math.max(1, nMembers)] : "";
 
-  // ---------- current question ----------
+  // ---------- question ----------
   useEffect(() => {
     if (!arena || !teamId) return;
     let alive = true;
@@ -154,6 +162,7 @@ export default function RelayPage() {
         setQuestion({ ...r.question, index: r.index, total: r.total });
         setInputText(r.question.sampleInput);
         setRunOut(null);
+        setCheckResults(null);
       })
       .catch(() => {});
     return () => {
@@ -161,82 +170,52 @@ export default function RelayPage() {
     };
   }, [arena, teamId, team?.qIndex, cfg?.roundId]);
 
+  // the code lives in this browser only (survives a reload), never in the database
+  const storeKey =
+    teamId && question && cfg?.roundId
+      ? `relay_code_${cfg.roundId}_${teamId}_${question.id}`
+      : null;
+
   useEffect(() => {
-    ctx.current = {
-      teamId,
-      qid: question?.id ?? "",
-      roundId: cfg?.roundId ?? "",
-      isHolder,
-    };
-  }, [teamId, question, cfg?.roundId, isHolder]);
+    if (!question || !storeKey) return;
+    let saved: string | null = null;
+    try {
+      saved = localStorage.getItem(storeKey);
+    } catch {}
+    setCode(saved ?? question.starterCode);
+  }, [question, storeKey]);
 
-  // when it becomes my turn (or the question changes), load the team's latest code
+  // swap-seats banner when the baton moves
   useEffect(() => {
-    if (!question || !teamId || !isHolder) return;
-    let alive = true;
-    const key = `${cfg?.roundId}_${question.id}`;
-    const apply = (c: string) => {
-      if (!alive) return;
-      setCode(c);
-      codeRef.current = c;
-      lastSaved.current = c;
-    };
-    getDoc(doc(db, "relayCode", teamId))
-      .then((s) =>
-        apply(s.exists() && s.data().key === key ? (s.data().code as string) : question.starterCode)
-      )
-      .catch(() => apply(question.starterCode));
-    return () => {
-      alive = false;
-    };
-  }, [question, isHolder, teamId, cfg?.roundId]);
+    if (!team) return;
+    if (prevHolder.current !== null && prevHolder.current !== team.holder) {
+      setHandoffUntil(Date.now() + 5000);
+    }
+    prevHolder.current = team.holder;
+  }, [team?.holder]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const flush = useCallback(async () => {
-    const c = ctx.current;
-    if (!c.teamId || !c.qid || !c.isHolder) return;
-    const text = codeRef.current;
-    if (text === lastSaved.current) return;
-    await setDoc(doc(db, "relayCode", c.teamId), {
-      code: text,
-      key: `${c.roundId}_${c.qid}`,
-      at: serverTimestamp(),
-    });
-    lastSaved.current = text;
-  }, []);
-
-  // checkpoint every 10 seconds while it is my turn
-  useEffect(() => {
-    if (!isHolder || !question) return;
-    const id = setInterval(() => {
-      flush().catch(() => {});
-    }, 10_000);
-    return () => clearInterval(id);
-  }, [isHolder, question, flush]);
-
-  // automatic baton pass when the leg time runs out
+  // automatic baton pass when the turn time runs out
   useEffect(() => {
     if (!expired || !teamId || !arena || legStartMs === 0) return;
     if (passedFor.current === legStartMs) return;
     passedFor.current = legStartMs;
-    const delay = isHolder ? 0 : 1500 + Math.random() * 1000;
-    const t = setTimeout(async () => {
-      try {
-        if (isHolder) await flush();
-        await api("/api/relay", { action: "pass", mode: "timeout", teamId });
-      } catch {
-        setTimeout(() => {
-          passedFor.current = 0;
-          setRetry((n) => n + 1);
-        }, 3000);
-      }
-    }, delay);
-    return () => clearTimeout(t);
-  }, [expired, legStartMs, teamId, arena, isHolder, flush, retry]);
+    api("/api/relay", { action: "pass", mode: "timeout", teamId }).catch(() => {
+      setTimeout(() => {
+        passedFor.current = 0;
+        setRetry((n) => n + 1);
+      }, 3000);
+    });
+  }, [expired, legStartMs, teamId, arena, retry]);
 
   // ---------- editor ----------
   function setBoth(next: string) {
-    codeRef.current = next;
     setCode(next);
+    setCheckResults(null);
+    if (storeKey) {
+      try {
+        localStorage.setItem(storeKey, next);
+      } catch {}
+    }
   }
   function insert(text: string) {
     const el = taRef.current;
@@ -262,21 +241,62 @@ export default function RelayPage() {
   }
 
   // ---------- actions ----------
+  // Run: your own input, unlimited, nothing stored
   async function onRun() {
-    if (busy) return;
+    if (busy || !question) return;
     setBusy("run");
     setRunOut(null);
     const [r] = await runPython(code, [inputText], 8000);
-    setRunOut({ output: r.output, error: r.error });
+    const isSample = normalizeOutput(inputText) === normalizeOutput(question.sampleInput);
+    setRunOut({
+      output: r.output,
+      error: r.error,
+      sampleMatch: isSample && !r.error
+        ? normalizeOutput(r.output) === normalizeOutput(question.sampleOutput)
+        : null,
+    });
     setBusy("");
   }
 
+  // Check tests: sample + hidden tests, unlimited, nothing stored
+  async function onCheck() {
+    if (busy || !teamId) return;
+    setBusy("check");
+    setCheckResults(null);
+    setNotice(null);
+    try {
+      const { inputs } = await api<{ token: string; inputs: string[] }>("/api/relay", {
+        action: "start",
+        teamId,
+      });
+      const results = await runPython(code, inputs, 15000);
+      const res = await api<{ results: boolean[] }>("/api/relay", {
+        action: "check",
+        teamId,
+        outputs: results.map((r) => r.output),
+      });
+      setCheckResults(
+        res.results.map((ok, i) => ({
+          label: i === 0 ? "Sample test" : `Test ${i + 1}`,
+          ok,
+          error: results[i].error,
+        }))
+      );
+    } catch (e) {
+      setNotice({
+        kind: "bad",
+        text: (e as Error).message === "time-up" ? "Time is up." : "Could not check the tests. Try again.",
+      });
+    }
+    setBusy("");
+  }
+
+  // Submit: the only action that is stored
   async function onSubmit() {
     if (busy || !question || !teamId) return;
     setBusy("submit");
     setNotice(null);
     try {
-      await flush();
       const { token, inputs } = await api<{ token: string; inputs: string[] }>("/api/relay", {
         action: "start",
         teamId,
@@ -288,33 +308,23 @@ export default function RelayPage() {
         token,
         outputs: results.map((r) => r.output),
       });
-      if (res.ok) {
-        setNotice({
-          kind: "ok",
-          text: res.finished
-            ? "Correct! Your team has finished every question."
-            : "Correct! Here is the next question.",
-        });
-      } else {
-        const sampleOk =
-          normalizeOutput(results[0].output) === normalizeOutput(question.sampleOutput);
-        setNotice({
-          kind: "bad",
-          text: sampleOk
-            ? "Your code matches the sample, but it is not correct for every valid input. Re-read the question and try your own values in the test input box."
-            : "Not correct yet. Compare your output with the expected output and try again.",
-        });
-      }
+      setNotice(
+        res.ok
+          ? {
+              kind: "ok",
+              text: res.finished
+                ? "Correct! Your team has finished every question."
+                : "Correct! Here is the next question.",
+            }
+          : {
+              kind: "bad",
+              text: "Not correct. That counted as a wrong submit. Use Check tests to see which tests fail.",
+            }
+      );
     } catch (e) {
-      const m = (e as Error).message;
       setNotice({
         kind: "bad",
-        text:
-          m === "not-holder"
-            ? "It is not your turn any more."
-            : m === "time-up"
-            ? "Time is up."
-            : "Could not submit. Check the connection and try again.",
+        text: (e as Error).message === "time-up" ? "Time is up." : "Could not submit. Check the connection and try again.",
       });
     }
     setBusy("");
@@ -324,7 +334,6 @@ export default function RelayPage() {
     if (busy || !teamId) return;
     setBusy("pass");
     try {
-      await flush();
       await api("/api/relay", { action: "pass", mode: "early", teamId });
     } catch {
       setNotice({ kind: "bad", text: "Could not pass the baton yet." });
@@ -338,23 +347,17 @@ export default function RelayPage() {
   if (cfg === undefined || teamId === undefined) {
     body = <p className="text-sm text-slate-600">Loading…</p>;
   } else if (!teamId || !team) {
-    body = (
-      <div className={card}>
-        You are not in a team for Code Relay. Tell an organiser.
-      </div>
-    );
+    body = <div className={card}>This login is not linked to a Code Relay team. Tell an organiser.</div>;
   } else if (!cfg || cfg.status === "idle") {
     body = <div className={card}>No relay round is open yet. Wait for the organiser.</div>;
   } else if (cfg.status === "lobby") {
     body = (
       <div className={card}>
         <h2 className="font-semibold text-[#101828]">{team.name}</h2>
-        <p className="mt-1 text-sm text-slate-600">
-          Team members: {team.memberNames.join(", ")}.
-        </p>
+        <p className="mt-1 text-sm text-slate-600">Members: {team.memberNames.join(", ")}.</p>
         <p className="mt-2 text-sm text-slate-600">
-          {cfg.name}: {cfg.durationMin} minutes in total, {Math.round(cfg.legSec / 60 * 10) / 10}{" "}
-          minutes per member. Wait for the organiser to start.
+          {cfg.name}: {cfg.durationMin} minutes in total, {Math.round((cfg.legSec / 60) * 10) / 10}{" "}
+          minutes per member. Sit down in the order above and wait for the organiser to start.
         </p>
       </div>
     );
@@ -364,7 +367,7 @@ export default function RelayPage() {
         <div className={card}>
           <h2 className="font-semibold text-[#101828]">{team.name}</h2>
           <p className="mt-1 text-sm text-slate-700">
-            {finished ? "Your team finished every question. " : timeUp || cfg.status === "closed" ? "The round is over. " : ""}
+            {finished ? "Your team finished every question. " : "The round is over. "}
             Solved {team.solved} of {total}, with {team.wrong} wrong submits.
           </p>
         </div>
@@ -400,10 +403,7 @@ export default function RelayPage() {
   } else if (!question) {
     body = <p className="text-sm text-slate-600">Loading your question…</p>;
   } else {
-    const n = team.memberUids.length;
-    const holderName = team.memberNames[team.holder];
-    const turnsAway = myIndex >= 0 ? (myIndex - team.holder + n) % n : 0;
-    const myTurnIn = (legMsLeft ?? 0) + Math.max(0, turnsAway - 1) * (cfg.legSec * 1000);
+    const locked = phase !== "active" || handoff || busy === "submit" || busy === "check";
     body = (
       <>
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700">
@@ -417,25 +417,35 @@ export default function RelayPage() {
           <span className="font-semibold text-teal-700">Time left {fmt(endsAt - serverNow)}</span>
         </div>
 
-        <div
-          className={`rounded-xl border px-4 py-3 text-sm ${
-            isHolder ? "border-teal-700 bg-teal-50 text-slate-800" : "border-slate-200 bg-white text-slate-700"
-          }`}
-        >
-          {isHolder ? (
-            <>
-              <b>Your turn.</b> Your leg ends in <b>{fmt(legMsLeft ?? 0)}</b>.{" "}
-              {passMsLeft !== null && passMsLeft > 0
-                ? `You can pass the baton in ${fmt(passMsLeft)}.`
-                : "You can pass the baton now."}
-            </>
-          ) : (
-            <>
-              <b>{holderName}</b> is coding. Your turn comes in about <b>{fmt(myTurnIn)}</b> (sooner
-              if they pass early). The code stays hidden until your turn.
-            </>
-          )}
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-teal-700 bg-teal-50 px-4 py-3 text-sm text-slate-800">
+          <span>
+            Now coding: <b>{holderName}</b>. Turn ends in <b>{fmt(legMsLeft ?? 0)}</b>.
+            {nMembers > 1 && (
+              <>
+                {" "}
+                Next: <b>{nextName}</b>.
+              </>
+            )}
+          </span>
+          <span className="flex items-center gap-3">
+            {passMsLeft !== null && passMsLeft > 0 && (
+              <span className="text-xs text-slate-600">Early pass in {fmt(passMsLeft)}</span>
+            )}
+            <button
+              className={btnGhost}
+              onClick={onPass}
+              disabled={!!busy || nMembers < 2 || (passMsLeft !== null && passMsLeft > 0)}
+            >
+              Pass the baton
+            </button>
+          </span>
         </div>
+
+        {handoff && (
+          <p role="status" className="rounded-xl bg-amber-50 px-4 py-3 text-sm font-medium text-amber-900">
+            Swap seats. {holderName} is up now. The editor opens in a few seconds.
+          </p>
+        )}
 
         <div className="grid gap-4 lg:grid-cols-2">
           <div className={card}>
@@ -464,72 +474,92 @@ export default function RelayPage() {
               </div>
             </div>
             <p className="mt-3 text-xs text-slate-500">
-              Your program is checked on more inputs than the sample, so make it work for any
-              valid value.
+              Your program is also tested on other, hidden values, so make it work for any valid input.
             </p>
           </div>
 
           <div className={card}>
-            {isHolder ? (
-              <>
-                <textarea
-                  ref={taRef}
-                  value={code}
-                  onChange={(e) => setBoth(e.target.value)}
-                  onKeyDown={onEditorKey}
-                  readOnly={phase !== "active" || busy === "submit"}
-                  spellCheck={false}
-                  autoCapitalize="off"
-                  autoCorrect="off"
-                  rows={14}
-                  className="w-full rounded-md border border-slate-300 bg-slate-50 p-3 font-mono text-sm leading-6 outline-none focus:border-teal-700 focus:ring-2 focus:ring-teal-700/20"
-                />
-                <label className="mt-3 block text-xs font-medium text-slate-500">
-                  Test input (change it to try your own values)
-                  <textarea
-                    value={inputText}
-                    onChange={(e) => setInputText(e.target.value)}
-                    rows={2}
-                    spellCheck={false}
-                    className="mt-1 w-full rounded-md border border-slate-300 p-2 font-mono text-sm"
-                  />
-                </label>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  <button className={btnGhost} onClick={onRun} disabled={!!busy}>
-                    {busy === "run" ? "Running…" : "Run"}
-                  </button>
-                  <button className={btn} onClick={onSubmit} disabled={!!busy}>
-                    {busy === "submit" ? "Checking…" : "Submit"}
-                  </button>
-                  <button
-                    className={btnGhost}
-                    onClick={onPass}
-                    disabled={!!busy || (passMsLeft !== null && passMsLeft > 0)}
-                  >
-                    Pass the baton
-                  </button>
-                </div>
-                {runOut && (
-                  <div className="mt-3">
-                    <p className="text-xs font-medium text-slate-500">Output</p>
-                    <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded-md bg-slate-900 p-2 font-mono text-sm text-slate-100">
-                      {runOut.output}
-                      {runOut.error && (
-                        <span className="text-red-300">
-                          {runOut.output ? "\n" : ""}
-                          {runOut.error}
-                        </span>
-                      )}
-                    </pre>
-                  </div>
-                )}
-              </>
-            ) : (
-              <p className="text-sm text-slate-600">
-                Read the question and plan with your team. The editor opens for you when {holderName}{" "}
-                passes the baton or their time ends.
-              </p>
+            <textarea
+              ref={taRef}
+              value={code}
+              onChange={(e) => setBoth(e.target.value)}
+              onKeyDown={onEditorKey}
+              readOnly={locked}
+              spellCheck={false}
+              autoCapitalize="off"
+              autoCorrect="off"
+              rows={14}
+              className="w-full rounded-md border border-slate-300 bg-slate-50 p-3 font-mono text-sm leading-6 outline-none focus:border-teal-700 focus:ring-2 focus:ring-teal-700/20"
+            />
+            <label className="mt-3 block text-xs font-medium text-slate-500">
+              Test input for Run (starts as the sample, type any value you like)
+              <textarea
+                value={inputText}
+                onChange={(e) => setInputText(e.target.value)}
+                rows={2}
+                spellCheck={false}
+                className="mt-1 w-full rounded-md border border-slate-300 p-2 font-mono text-sm"
+              />
+            </label>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button className={btnGhost} onClick={onRun} disabled={!!busy}>
+                {busy === "run" ? "Running…" : "Run"}
+              </button>
+              <button className={btnGhost} onClick={onCheck} disabled={!!busy}>
+                {busy === "check" ? "Checking…" : "Check tests"}
+              </button>
+              <button className={btn} onClick={onSubmit} disabled={!!busy}>
+                {busy === "submit" ? "Submitting…" : "Submit"}
+              </button>
+            </div>
+            <p className="mt-2 text-xs text-slate-500">
+              Run and Check tests are free and unlimited. Only Submit counts.
+            </p>
+
+            {runOut && (
+              <div className="mt-3">
+                <p className="text-xs font-medium text-slate-500">
+                  Output
+                  {runOut.sampleMatch === true && (
+                    <span className="ml-2 text-teal-700">Matches the expected output</span>
+                  )}
+                  {runOut.sampleMatch === false && (
+                    <span className="ml-2 text-red-700">Does not match the expected output</span>
+                  )}
+                </p>
+                <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded-md bg-slate-900 p-2 font-mono text-sm text-slate-100">
+                  {runOut.output}
+                  {runOut.error && (
+                    <span className="text-red-300">
+                      {runOut.output ? "\n" : ""}
+                      {runOut.error}
+                    </span>
+                  )}
+                </pre>
+              </div>
             )}
+
+            {checkResults && (
+              <div className="mt-3 rounded-md border border-slate-200 p-2 text-sm">
+                <p className="font-medium text-slate-800">
+                  {checkResults.every((r) => r.ok)
+                    ? "All tests passed. You can submit."
+                    : `${checkResults.filter((r) => r.ok).length} of ${checkResults.length} tests passed.`}
+                </p>
+                <ul className="mt-1">
+                  {checkResults.map((r) => (
+                    <li key={r.label} className={r.ok ? "text-teal-800" : "text-red-700"}>
+                      {r.ok ? "Passed" : "Failed"}: {r.label}
+                      {!r.ok && r.error ? ` (${r.error})` : ""}
+                    </li>
+                  ))}
+                </ul>
+                <p className="mt-1 text-xs text-slate-500">
+                  The other tests use hidden values, so their inputs are not shown.
+                </p>
+              </div>
+            )}
+
             {notice && (
               <p
                 role="status"

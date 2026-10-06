@@ -8,7 +8,8 @@ import { normalizeOutput } from "@/lib/relay";
 export const dynamic = "force-dynamic";
 
 interface Team {
-  memberUids: string[];
+  uid: string;
+  memberNames: string[];
   order: string[];
   qIndex: number;
   holder: number;
@@ -51,7 +52,7 @@ export async function POST(req: Request) {
     const team = teamSnap.data() as Team;
     const cfg = cfgSnap.data() as Cfg | undefined;
 
-    if (!team.memberUids.includes(user.uid)) throw new ApiError(403, "not-member");
+    if (team.uid !== user.uid) throw new ApiError(403, "not-your-team");
     if (!cfg || cfg.status !== "running" || !cfg.startedAt) {
       throw new ApiError(409, "round-not-running");
     }
@@ -61,7 +62,6 @@ export async function POST(req: Request) {
     }
     if (team.status !== "active") throw new ApiError(409, "team-not-active");
 
-    const isHolder = team.memberUids[team.holder] === user.uid;
     const qid = team.order[team.qIndex];
     const legStart = team.legStartedAt?.toMillis() ?? now;
 
@@ -69,7 +69,6 @@ export async function POST(req: Request) {
     if (action === "pass") {
       const mode = body.mode;
       if (mode === "early") {
-        if (!isHolder) throw new ApiError(403, "not-holder");
         if (now < legStart + cfg.minPassSec * 1000) throw new ApiError(409, "too-soon");
       } else if (mode === "timeout") {
         if (now < legStart + cfg.legSec * 1000 - 500) {
@@ -80,11 +79,9 @@ export async function POST(req: Request) {
       }
       const changed = await db.runTransaction(async (tx) => {
         const cur = (await tx.get(teamRef)).data() as Team;
-        if (cur.legStartedAt?.toMillis() !== team.legStartedAt?.toMillis()) {
-          return false; // someone else already passed
-        }
+        if (cur.legStartedAt?.toMillis() !== team.legStartedAt?.toMillis()) return false;
         tx.update(teamRef, {
-          holder: (cur.holder + 1) % cur.memberUids.length,
+          holder: (cur.holder + 1) % Math.max(1, cur.memberNames.length),
           legStartedAt: Timestamp.fromMillis(now),
         });
         return true;
@@ -92,7 +89,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true, noop: !changed });
     }
 
-    // ---------- question / submit ----------
+    // ---------- question / tests ----------
     if (!qid) throw new ApiError(409, "no-question");
     const bank = await getBank();
     const q = bank.find((x) => x.id === qid);
@@ -115,11 +112,26 @@ export async function POST(req: Request) {
       });
     }
 
-    if (!isHolder) throw new ApiError(403, "not-holder");
     if (!q.sampleOutput || !q.hiddenOutputs?.length) {
       throw new ApiError(500, "bank-not-ready");
     }
+    const expected = [q.sampleOutput, ...q.hiddenOutputs];
 
+    // pass/fail per test; expected outputs never leave the server
+    const grade = (outputs: unknown): boolean[] => {
+      if (
+        !Array.isArray(outputs) ||
+        outputs.length !== expected.length ||
+        outputs.some((o) => typeof o !== "string" || o.length > 20000)
+      ) {
+        throw new ApiError(400, "bad-request");
+      }
+      return expected.map(
+        (e, i) => normalizeOutput(outputs[i] as string) === normalizeOutput(e)
+      );
+    };
+
+    // The browser asks for the test inputs, runs the code, sends the outputs back
     if (action === "start") {
       const token = signToken({
         teamId,
@@ -131,8 +143,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ token, inputs: [q.sampleInput, ...q.hiddenInputs] });
     }
 
+    // Check tests: nothing is stored
+    if (action === "check") {
+      return NextResponse.json({ results: grade(body.outputs) });
+    }
+
+    // Submit: the only action that is stored
     if (action === "finish") {
-      const { token, outputs } = body;
+      const token = body.token;
       const p = typeof token === "string" ? verifyToken<TokenPayload>(token) : null;
       if (
         !p ||
@@ -144,17 +162,7 @@ export async function POST(req: Request) {
       ) {
         throw new ApiError(409, "stale-submit");
       }
-      const expected = [q.sampleOutput, ...q.hiddenOutputs];
-      if (
-        !Array.isArray(outputs) ||
-        outputs.length !== expected.length ||
-        outputs.some((o) => typeof o !== "string" || o.length > 20000)
-      ) {
-        throw new ApiError(400, "bad-request");
-      }
-      const ok = expected.every(
-        (e, i) => normalizeOutput(outputs[i] as string) === normalizeOutput(e)
-      );
+      const ok = grade(body.outputs).every(Boolean);
       const finished = ok && team.qIndex + 1 >= team.order.length;
 
       await db.runTransaction(async (tx) => {

@@ -40,9 +40,9 @@ interface Student {
 interface TeamRow {
   id: string;
   name: string;
-  memberUids: string[];
+  uid: string;
+  username: string;
   memberNames: string[];
-  memberUsernames: string[];
   solved: number;
   wrong: number;
   lastSolveMs: number;
@@ -67,11 +67,12 @@ function shuffle<T>(arr: T[]): T[] {
 const orderFor = (qs: BankQuestion[]) =>
   [1, 2, 3].flatMap((t) => shuffle(qs.filter((q) => q.tier === t)).map((q) => q.id));
 
-const newTeamDoc = (name: string, members: Student[]) => ({
+// One login per team. Member names are just the people's details.
+const teamDoc = (name: string, login: Student, memberNames: string[]) => ({
   name,
-  memberUids: members.map((m) => m.id),
-  memberNames: members.map((m) => m.name),
-  memberUsernames: members.map((m) => m.username),
+  uid: login.id,
+  username: login.username,
+  memberNames,
   order: [],
   qIndex: 0,
   holder: 0,
@@ -99,14 +100,22 @@ export default function AdminRelayPage() {
   const [legSec, setLegSec] = useState(300);
   const [minPassSec, setMinPassSec] = useState(60);
 
-  // manual team
+  // teams
+  const [bulk, setBulk] = useState("");
   const [teamName, setTeamName] = useState("");
-  const [members, setMembers] = useState(["", "", ""]);
+  const [login, setLogin] = useState("");
+  const [people, setPeople] = useState(["", "", ""]);
 
   // add question
   const [nq, setNq] = useState({
-    title: "", tier: "1", type: "write", prompt: "", starterCode: "# Write your program below\n",
-    sampleInput: "", hidden: "", solution: "",
+    title: "",
+    tier: "1",
+    type: "write",
+    prompt: "",
+    starterCode: "# Write your program below\n",
+    sampleInput: "",
+    hidden: "",
+    solution: "",
   });
 
   useEffect(
@@ -122,9 +131,9 @@ export default function AdminRelayPage() {
         return {
           id: d.id,
           name: x.name,
-          memberUids: x.memberUids,
-          memberNames: x.memberNames,
-          memberUsernames: x.memberUsernames,
+          uid: x.uid ?? "",
+          username: x.username ?? "",
+          memberNames: x.memberNames ?? [],
           solved: x.solved ?? 0,
           wrong: x.wrong ?? 0,
           lastSolveMs: x.lastSolveAt?.toMillis?.() ?? 0,
@@ -148,6 +157,10 @@ export default function AdminRelayPage() {
 
   const cfgRef = doc(db, "config", "relay");
   const status = cfg?.status;
+  const freeLogins = useMemo(() => {
+    const used = new Set(teams.map((t) => t.uid));
+    return students.filter((s) => !used.has(s.id));
+  }, [students, teams]);
 
   // ---------- round ----------
   const createRound = () =>
@@ -194,33 +207,41 @@ export default function AdminRelayPage() {
   const closeRound = () => updateDoc(cfgRef, { status: "closed" });
 
   // ---------- teams ----------
-  async function addTeam() {
-    const picked = members.filter(Boolean);
-    const chosen = students.filter((s) => picked.includes(s.id));
-    const used = new Set(teams.flatMap((t) => t.memberUids));
-    if (!teamName.trim()) return setMsg("Give the team a name.");
-    if (new Set(picked).size !== picked.length || chosen.length < 2) {
-      return setMsg("Pick at least 2 different members.");
+  // One line per team:  Team name | Member 1, Member 2, Member 3
+  // Each team gets the next free login automatically.
+  async function bulkAdd() {
+    const lines = bulk.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (lines.length === 0) return setMsg("Paste at least one line.");
+    if (lines.length > freeLogins.length) {
+      return setMsg(`${lines.length} teams but only ${freeLogins.length} free logins.`);
     }
-    if (chosen.some((s) => used.has(s.id))) return setMsg("A member is already in another team.");
-    await setDoc(doc(collection(db, "relayTeams")), newTeamDoc(teamName.trim(), chosen));
-    setTeamName("");
-    setMembers(["", "", ""]);
-    setMsg("Team added.");
+    const batch = writeBatch(db);
+    for (let i = 0; i < lines.length; i++) {
+      const [rawName, rawMembers = ""] = lines[i].split("|");
+      const tName = rawName.trim();
+      const memberNames = rawMembers.split(",").map((s) => s.trim()).filter(Boolean);
+      if (!tName || memberNames.length === 0) {
+        return setMsg(`Line ${i + 1}: use  Team name | Member 1, Member 2, Member 3`);
+      }
+      batch.set(doc(collection(db, "relayTeams")), teamDoc(tName, freeLogins[i], memberNames));
+    }
+    await batch.commit();
+    setBulk("");
+    setMsg(`Added ${lines.length} teams. Each has its own login, shown in the list below.`);
     loadTeams();
   }
 
-  async function autoTeams() {
-    const used = new Set(teams.flatMap((t) => t.memberUids));
-    const free = shuffle(students.filter((s) => !used.has(s.id)));
-    if (free.length === 0) return setMsg("Every student is already in a team.");
-    const batch = writeBatch(db);
-    let n = teams.length;
-    for (let i = 0; i < free.length; i += 3) {
-      batch.set(doc(collection(db, "relayTeams")), newTeamDoc(`Team ${++n}`, free.slice(i, i + 3)));
-    }
-    await batch.commit();
-    setMsg(`Created ${Math.ceil(free.length / 3)} teams. The last one may have fewer than 3 members.`);
+  async function addTeam() {
+    const memberNames = people.map((p) => p.trim()).filter(Boolean);
+    const chosen = students.find((s) => s.id === login);
+    if (!teamName.trim()) return setMsg("Give the team a name.");
+    if (!chosen) return setMsg("Pick a login for the team.");
+    if (memberNames.length === 0) return setMsg("Enter at least one member name.");
+    await setDoc(doc(collection(db, "relayTeams")), teamDoc(teamName.trim(), chosen, memberNames));
+    setTeamName("");
+    setLogin("");
+    setPeople(["", "", ""]);
+    setMsg("Team added.");
     loadTeams();
   }
 
@@ -250,7 +271,11 @@ export default function AdminRelayPage() {
     }
     await setDoc(doc(db, "config", "relayBank"), { questions: out });
     setBank(out);
-    setMsg(errs.length ? `Some solutions failed: ${errs.join("; ")}` : `Computed outputs for ${out.length} questions.`);
+    setMsg(
+      errs.length
+        ? `Some solutions failed: ${errs.join("; ")}`
+        : `Computed outputs for ${out.length} questions.`
+    );
     setBusy(false);
   }
 
@@ -292,7 +317,8 @@ export default function AdminRelayPage() {
       ),
     [teams]
   );
-  const secs = (t: TeamRow) => (t.lastSolveMs && startMs ? Math.round((t.lastSolveMs - startMs) / 1000) : 0);
+  const secs = (t: TeamRow) =>
+    t.lastSolveMs && startMs ? Math.round((t.lastSolveMs - startMs) / 1000) : 0;
   const mmss = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 
   const publish = () =>
@@ -305,8 +331,6 @@ export default function AdminRelayPage() {
         timeSec: secs(t),
       })),
     });
-
-  const unassigned = students.length - new Set(teams.flatMap((t) => t.memberUids)).size;
 
   return (
     <div className="min-h-screen bg-[#eef2f6]">
@@ -345,43 +369,64 @@ export default function AdminRelayPage() {
             <button className={btnGhost} disabled={status !== "running"} onClick={closeRound}>Close round</button>
           </div>
           <p className="mt-2 text-xs text-slate-500">
-            Start gives every team its own shuffled question order and starts the clocks. Creating a round
-            keeps your teams.
+            Start gives every team its own shuffled question order and starts the clocks. Creating a
+            round keeps your teams.
           </p>
         </section>
 
         {/* TEAMS */}
         <section className={card}>
-          <div className="flex items-center justify-between">
-            <h2 className="font-semibold text-[#101828]">Teams ({teams.length}), {unassigned} students not in a team</h2>
-            <button className={btnGhost} onClick={autoTeams} disabled={unassigned === 0}>
-              Auto-create teams of 3
-            </button>
-          </div>
-          <div className="mt-3 flex flex-wrap items-end gap-3">
+          <h2 className="font-semibold text-[#101828]">
+            Teams ({teams.length}), {freeLogins.length} free logins
+          </h2>
+          <p className="mt-1 text-xs text-slate-500">
+            Each team plays on one login and one computer. The member names are shown on the team's
+            screen. These teams are used only for Code Relay.
+          </p>
+
+          <label className="mt-3 block text-sm text-slate-700">
+            Add many teams (one per line: Team name | Member 1, Member 2, Member 3)
+            <textarea
+              rows={4}
+              className={`${field} w-full font-mono`}
+              value={bulk}
+              onChange={(e) => setBulk(e.target.value)}
+              placeholder={"Team Alpha | Ravi, Meena, Zoe\nTeam Beta | Asha, Kiran, Dev"}
+            />
+          </label>
+          <button className={`${btn} mt-2`} onClick={bulkAdd}>Add teams (next free logins)</button>
+
+          <div className="mt-5 flex flex-wrap items-end gap-3 border-t border-slate-100 pt-4">
             <label className="text-sm text-slate-700">Team name
               <input className={field} value={teamName} onChange={(e) => setTeamName(e.target.value)} />
             </label>
-            {members.map((m, i) => (
+            <label className="text-sm text-slate-700">Login
+              <select className={field} value={login} onChange={(e) => setLogin(e.target.value)}>
+                <option value="">(choose)</option>
+                {freeLogins.map((s) => (
+                  <option key={s.id} value={s.id}>{s.username}</option>
+                ))}
+              </select>
+            </label>
+            {people.map((p, i) => (
               <label key={i} className="text-sm text-slate-700">Member {i + 1}
-                <select
+                <input
                   className={field}
-                  value={m}
-                  onChange={(e) => setMembers((ms) => ms.map((x, j) => (j === i ? e.target.value : x)))}
-                >
-                  <option value="">(none)</option>
-                  {students.map((s) => (
-                    <option key={s.id} value={s.id}>{s.username}</option>
-                  ))}
-                </select>
+                  value={p}
+                  onChange={(e) => setPeople((ps) => ps.map((x, j) => (j === i ? e.target.value : x)))}
+                />
               </label>
             ))}
-            <button className={btn} onClick={addTeam}>Add team</button>
+            <button className={btn} onClick={addTeam}>Add one team</button>
           </div>
+
           <ul className="mt-4 space-y-1 text-sm text-slate-700">
             {teams.map((t) => (
               <li key={t.id} className="flex items-center justify-between border-t border-slate-100 py-1">
-                <span><b>{t.name}</b>: {t.memberUsernames.join(", ")}</span>
+                <span>
+                  <b>{t.name}</b> (login: <code>{t.username || "old format, remove it"}</code>):{" "}
+                  {t.memberNames.join(", ")}
+                </span>
                 <button className={btnGhost} onClick={() => removeTeam(t.id)} disabled={status === "running"}>
                   Remove
                 </button>
@@ -411,6 +456,7 @@ export default function AdminRelayPage() {
               <tr>
                 <th className="py-1 font-medium">#</th>
                 <th className="py-1 font-medium">Team</th>
+                <th className="py-1 font-medium">Login</th>
                 <th className="py-1 font-medium">Solved</th>
                 <th className="py-1 font-medium">Wrong</th>
                 <th className="py-1 font-medium">Last solve</th>
@@ -422,6 +468,7 @@ export default function AdminRelayPage() {
                 <tr key={t.id} className="border-t border-slate-100">
                   <td className="py-1">{i + 1}</td>
                   <td className="py-1">{t.name}</td>
+                  <td className="py-1">{t.username}</td>
                   <td className="py-1">{t.solved}</td>
                   <td className="py-1">{t.wrong}</td>
                   <td className="py-1">{t.lastSolveMs ? mmss(secs(t)) : "-"}</td>
@@ -454,7 +501,9 @@ export default function AdminRelayPage() {
                 <div className="mt-2 grid gap-2 sm:grid-cols-2">
                   <pre className="whitespace-pre-wrap rounded bg-slate-100 p-2 text-xs">{`Sample input:\n${q.sampleInput}\n\nSample output:\n${q.sampleOutput}`}</pre>
                   <pre className="whitespace-pre-wrap rounded bg-slate-100 p-2 text-xs">
-                    {q.hiddenInputs.map((h, i) => `Hidden ${i + 1} input:\n${h}\nOutput:\n${q.hiddenOutputs[i] ?? "(not computed)"}`).join("\n\n")}
+                    {q.hiddenInputs
+                      .map((h, i) => `Hidden ${i + 1} input:\n${h}\nOutput:\n${q.hiddenOutputs[i] ?? "(not computed)"}`)
+                      .join("\n\n")}
                   </pre>
                 </div>
               </details>
