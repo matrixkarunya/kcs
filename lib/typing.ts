@@ -1,7 +1,7 @@
 export const COUNTDOWN_MS = 10_000;
 export const PRACTICE_SECONDS = 30;
 export const PRACTICE_TEXT =
-  "Practice makes the keys feel natural. Keep your eyes on the text and let your fingers find their own rhythm. There is no backspace in the real test, so a steady pace beats a fast mistake. Breathe, relax your shoulders, and type each word with care until the timer ends.";
+  "practice makes the keys feel natural keep your eyes on the text and let your fingers find their own rhythm there is no backspace in the real test so a steady pace beats a fast mistake breathe relax your shoulders and type each word with care until the timer ends";
 
 export type RoundStatus = "idle" | "lobby" | "running" | "closed";
 

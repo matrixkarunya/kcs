@@ -1,11 +1,22 @@
+// Usage:
+//   node scripts/seed-typing.mjs          (skips if the pool already exists)
+//   node scripts/seed-typing.mjs --force  (replaces the pool)
+// Key location: KEY_PATH env var, or the default below. Never commit the key.
 import { initializeApp, cert } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 import { readFileSync } from "fs";
 
 const force = process.argv.includes("--force");
-const sa = JSON.parse(
-  readFileSync(new URL("../serviceAccountKey.json", import.meta.url), "utf8")
-);
+
+const KEY_PATH = process.env.KEY_PATH || "C:/Users/Asus/keys/kcs-key.json";
+let sa;
+try {
+  sa = JSON.parse(readFileSync(new URL("../serviceAccountKey.json", import.meta.url), "utf8"));
+  
+} catch (e) {
+  console.error(`Cannot read key at ${KEY_PATH}:`, e.message);
+  process.exit(1);
+}
 initializeApp({ credential: cert(sa) });
 const db = getFirestore();
 
@@ -24,34 +35,56 @@ const P = [
   "A college community grows stronger when students share what they know. A club meeting, a weekend workshop, or a friendly competition gives people a chance to practice skills that classrooms rarely have time to cover. Beginners learn faster when they sit next to someone who has already made the same mistakes, and experienced members gain a deeper understanding by teaching. Events like these also create friendships that last long after the semester ends. The next time an invitation appears on your screen, consider saying yes, because the most valuable lessons often arrive when you try something unfamiliar with people who are willing to learn alongside you.",
 ];
 
+// lowercase, letters/numbers/spaces only, single spaces
+const clean = (s) =>
+  s
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const CLEAN_P = P.map(clean);
+
 // 12 + 8 = 20 different passages, each built from 3 paragraphs
 const combos = [];
 for (let a = 0; a < 12; a++) combos.push([a, (a + 4) % 12, (a + 8) % 12]);
 for (let a = 0; a < 8; a++) combos.push([a, (a + 3) % 12, (a + 7) % 12]);
 const passages = combos.map((c, i) => ({
   id: `p${String(i + 1).padStart(2, "0")}`,
-  text: c.map((k) => P[k]).join(" "),
+  text: c.map((k) => CLEAN_P[k]).join(" "),
 }));
 
-const poolRef = db.doc("config/typingPool");
-const pool = await poolRef.get();
-if (pool.exists && !force) {
-  console.log("Pool already exists, skipping (use --force to replace it).");
-} else {
-  await poolRef.set({ passages });
-  console.log(`Seeded ${passages.length} passages`);
-}
+try {
+  // safety check: nothing but lowercase letters, digits and single spaces
+  console.log("Sample:", passages[0].text.slice(0, 120));
+  if (passages.some((p) => !/^[a-z0-9]+( [a-z0-9]+)*$/.test(p.text))) {
+    console.error("Passages still contain caps or punctuation, aborting.");
+    process.exit(1);
+  }
 
-const cfgRef = db.doc("config/typing");
-if (!(await cfgRef.get()).exists) {
-  await cfgRef.set({
-    roundId: null,
-    name: "",
-    durationSec: 120,
-    status: "idle",
-    startedAt: null,
-    leaderboard: null,
-  });
-  console.log("Created config/typing");
+  const poolRef = db.doc("config/typingPool");
+  const pool = await poolRef.get();
+  if (pool.exists && !force) {
+    console.log("Pool already exists, skipping (use --force to replace it).");
+  } else {
+    await poolRef.set({ passages });
+    console.log(`Seeded ${passages.length} passages`);
+  }
+
+  const cfgRef = db.doc("config/typing");
+  if (!(await cfgRef.get()).exists) {
+    await cfgRef.set({
+      roundId: null,
+      name: "",
+      durationSec: 120,
+      status: "idle",
+      startedAt: null,
+      leaderboard: null,
+    });
+    console.log("Created config/typing");
+  }
+  process.exit(0);
+} catch (e) {
+  console.error("SEED FAILED:", e.message);
+  process.exit(1);
 }
-process.exit(0);
