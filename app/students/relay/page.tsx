@@ -209,7 +209,8 @@ export default function RelayPage() {
   const capReached = doneByHolder >= cap;
   const canPass = capReached || (passMsLeft !== null && passMsLeft <= 0);
   const holderName = team?.memberNames[team.holder] ?? "";
-  const nextName = team ? team.memberNames[(team.holder + 1) % Math.max(1, nMembers)] : "";
+  const isLast = !!team && team.holder >= nMembers - 1;
+  const nextName = team && !isLast ? team.memberNames[team.holder + 1] : "";
 
   // ---------- question ----------
   useEffect(() => {
@@ -506,7 +507,7 @@ export default function RelayPage() {
             {team.endedEarly
               ? "Your team ended the section."
               : finished
-              ? "Your team went through every question."
+              ? "Your team has completed all its turns."
               : "The round is over."}
           </p>
           <div className="mt-4 grid grid-cols-3 gap-3 text-center">
@@ -610,7 +611,7 @@ export default function RelayPage() {
               <p className="text-xl font-bold text-slate-900">{holderName}</p>
               <p className="text-xs text-slate-600">
                 Questions used: <b>{doneByHolder}</b> of {cap}
-                {nMembers > 1 && (
+                {nMembers > 1 && !isLast && (
                   <>
                     {" "}
                     · Next up: <b>{nextName}</b>
@@ -633,9 +634,9 @@ export default function RelayPage() {
                 <button
                   className={capReached ? btn : btnGhost}
                   onClick={onPass}
-                  disabled={!!busy || awaitNext || handoff || nMembers < 2 || !canPass}
+                  disabled={!!busy || awaitNext || handoff || !canPass}
                 >
-                  Pass the baton
+                  {isLast ? "Finish my turn" : "Pass the baton"}
                 </button>
                 {!canPass && passMsLeft !== null && (
                   <span className="text-xs text-slate-500">Early pass in {fmt(passMsLeft)}</span>
@@ -661,10 +662,34 @@ export default function RelayPage() {
           </div>
         </div>
 
-        {capReached && (
-          <p role="status" className="rounded-xl bg-amber-50 px-4 py-3 text-sm font-medium text-amber-900">
-            {holderName} has used all {cap} questions. Pass the baton to the next member.
-          </p>
+        {/* set complete overlay: lives on the server state, so it returns after a reload */}
+        {capReached && !handoff && !awaitNext && (
+          <div className="fixed inset-0 z-[55] flex items-center justify-center bg-teal-900/95 px-4 text-center text-white">
+            <div className="max-w-xl">
+              <p className="text-sm font-semibold uppercase tracking-[0.3em] text-teal-200">
+                Set complete
+              </p>
+              <p className="mt-4 text-4xl font-bold sm:text-5xl">
+                {holderName} has used all {cap} questions
+              </p>
+              <p className="mt-4 text-lg text-teal-100">
+                {isLast
+                  ? "You are the last member. Finishing ends the section for your team."
+                  : `Pass the baton so ${nextName} can start.`}
+              </p>
+              <button
+                onClick={onPass}
+                disabled={!!busy}
+                className="mt-10 rounded-2xl bg-white px-10 py-5 text-2xl font-bold text-teal-900 shadow-2xl transition hover:bg-teal-50 disabled:opacity-60"
+              >
+                {busy === "pass"
+                  ? "Passing…"
+                  : isLast
+                  ? "Finish the section"
+                  : `Pass the baton to ${nextName}`}
+              </button>
+            </div>
+          </div>
         )}
 
         <div className="grid gap-4 lg:grid-cols-5">

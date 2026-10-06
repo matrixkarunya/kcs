@@ -64,7 +64,6 @@ function settle(cur: Team, now: number): Record<string, unknown> {
 
 const countsOf = (t: Team) =>
   Array.from({ length: Math.max(1, t.memberNames.length) }, (_, i) => t.memberCounts?.[i] ?? 0);
-const allFull = (cs: number[], cap: number) => cs.every((c) => c >= cap);
 
 export async function POST(req: Request) {
   try {
@@ -144,23 +143,14 @@ export async function POST(req: Request) {
       const result = await db.runTransaction(async (tx) => {
         const cur = (await tx.get(teamRef)).data() as Team;
         if (cur.legStartedAt?.toMillis() !== team.legStartedAt?.toMillis()) return "stale";
-        const cs = countsOf(cur);
-        const n = cs.length;
 
-        // next member who still has questions left
-        let next = -1;
-        for (let k = 1; k <= n; k++) {
-          const i = (cur.holder + k) % n;
-          if (cs[i] < cap) {
-            next = i;
-            break;
-          }
-        }
-        if (next === -1) {
+        const next = cur.holder + 1;
+
+        // the last member's turn is over (time, cap or early finish): the team is done
+        if (next >= Math.max(1, cur.memberNames.length)) {
           tx.update(teamRef, { status: "finished", judgingSince: null });
           return "ok";
         }
-        if (mode === "early" && next === cur.holder) throw new ApiError(409, "no-next");
 
         tx.update(teamRef, {
           holder: next,
@@ -188,7 +178,7 @@ export async function POST(req: Request) {
         const cs = countsOf(cur);
         if (cs[cur.holder] >= cap) throw new ApiError(409, "member-done");
         cs[cur.holder] += 1;
-        const done = cur.qIndex + 1 >= cur.order.length || allFull(cs, cap);
+        const done = cur.qIndex + 1 >= cur.order.length;
         tx.update(teamRef, {
           // the clock stays paused until the client confirms the next screen
           judgingSince: done ? null : cur.judgingSince ?? Timestamp.fromMillis(now),
@@ -296,7 +286,7 @@ export async function POST(req: Request) {
         const cs = countsOf(cur);
         if (cs[cur.holder] >= cap) throw new ApiError(409, "member-done");
         cs[cur.holder] += 1;
-        const done = cur.qIndex + 1 >= cur.order.length || allFull(cs, cap);
+        const done = cur.qIndex + 1 >= cur.order.length;
         tx.update(teamRef, {
           judgingSince: done ? null : pause, // stays paused until the next screen shows
           memberCounts: cs,
