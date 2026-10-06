@@ -19,6 +19,7 @@ interface Cfg {
   durationMin: number;
   legSec: number;
   minPassSec: number;
+  maxPerMember?: number;
   leaderboard:
     | { rank: number; team: string; solved: number; wrong: number; skipped?: number; timeSec: number }[]
     | null;
@@ -34,6 +35,9 @@ interface Team {
   wrong: number;
   skipped?: number;
   bonusMs?: number;
+  judgingSince?: Timestamp | null;
+  memberCounts?: number[];
+  endedEarly?: boolean;
   status: "waiting" | "active" | "finished";
 }
 type Question = PublicQuestion & { index: number; total: number };
@@ -42,18 +46,16 @@ interface TestResult {
   ok: boolean;
   error: string | null;
 }
-interface Frozen {
-  legLeft: number;
-  totalLeft: number;
-  legStart: number;
-  bonus: number;
-}
-type Busy = "" | "run" | "check" | "submit" | "pass" | "skip";
+type Busy = "" | "run" | "check" | "submit" | "pass" | "skip" | "end";
+
+const PAUSE_CAP = 60_000; // must match the server
+const DEFAULT_CAP = 5;
 
 const fmt = (ms: number) => {
   const s = Math.max(0, Math.ceil(ms / 1000));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 };
+const afterPaint = (fn: () => void) => requestAnimationFrame(() => requestAnimationFrame(fn));
 
 const card = "rounded-2xl border border-slate-200 bg-white p-5 shadow-sm";
 const btn =
@@ -94,11 +96,13 @@ export default function RelayPage() {
   const [busy, setBusy] = useState<Busy>("");
   const [notice, setNotice] = useState<{ kind: "ok" | "bad"; text: string } | null>(null);
   const [retry, setRetry] = useState(0);
-  const [frozen, setFrozen] = useState<Frozen | null>(null);
+  const [awaitNext, setAwaitNext] = useState(false); // waiting for the next question to show
   const [confirmSkip, setConfirmSkip] = useState(false);
+  const [confirmEnd, setConfirmEnd] = useState(false);
 
   const taRef = useRef<HTMLTextAreaElement>(null);
   const passedFor = useRef(0);
+  const resumeAfterQuestion = useRef(false);
 
   const running = cfg?.status === "running";
   const judging = busy === "check" || busy === "submit";
@@ -144,53 +148,68 @@ export default function RelayPage() {
     return () => clearInterval(id);
   }, [running]);
 
+  // notices fade away by themselves
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(null), 5000);
+    return () => clearTimeout(t);
+  }, [notice]);
+
+  const resume = () => {
+    if (teamId) api("/api/relay", { action: "resume", teamId }).catch(() => {});
+  };
+
+  // safety: never stay on the loader for ever
+  useEffect(() => {
+    if (!awaitNext) return;
+    const t = setTimeout(() => {
+      resumeAfterQuestion.current = false;
+      resume();
+      setAwaitNext(false);
+    }, 12000);
+    return () => clearTimeout(t);
+  }, [awaitNext]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ---------- derived ----------
   const serverNow = now + offset;
+  // While the server has a pause running, the clock stands still at the pause start.
+  const pausedSince = team?.judgingSince?.toMillis() ?? 0;
+  const paused = !!pausedSince && serverNow - pausedSince < PAUSE_CAP;
+  const effNow = pausedSince
+    ? serverNow - pausedSince < PAUSE_CAP
+      ? pausedSince
+      : serverNow - PAUSE_CAP
+    : serverNow;
+
   const bonus = team?.bonusMs ?? 0;
   const endsAt =
     running && cfg?.startedAt ? cfg.startedAt.toMillis() + cfg.durationMin * 60_000 + bonus : 0;
-  const timeUp = running && !frozen && endsAt > 0 && serverNow >= endsAt;
+  const timeUp = running && endsAt > 0 && effNow >= endsAt;
   const total = team?.order.length ?? 0;
   const finished =
     !!team && (team.status === "finished" || (total > 0 && team.qIndex >= total));
   const arena = running && !!team && team.status === "active" && !finished && !timeUp;
   const legStartMs = team?.legStartedAt?.toMillis() ?? 0;
 
-  const handoffMsLeft = arena && !frozen && legStartMs > serverNow ? legStartMs - serverNow : 0;
+  const handoffMsLeft = arena && legStartMs > effNow ? legStartMs - effNow : 0;
   const handoff = handoffMsLeft > 0;
 
-  const liveLegLeft =
+  const legMsLeft =
     arena && cfg && legStartMs
-      ? Math.min(cfg.legSec * 1000, legStartMs + cfg.legSec * 1000 - serverNow)
+      ? Math.min(cfg.legSec * 1000, legStartMs + cfg.legSec * 1000 - effNow)
       : null;
-  const legMsLeft = frozen ? frozen.legLeft : liveLegLeft;
-  const totalMsLeft = frozen ? frozen.totalLeft : endsAt - serverNow;
-  const passMsLeft =
-    arena && cfg && legStartMs && !frozen ? legStartMs + cfg.minPassSec * 1000 - serverNow : null;
-  const expired = !frozen && legMsLeft !== null && legMsLeft <= 0;
+  const totalMsLeft = endsAt - effNow;
+  const passMsLeft = arena && cfg && legStartMs ? legStartMs + cfg.minPassSec * 1000 - effNow : null;
+  const expired = !paused && legMsLeft !== null && legMsLeft <= 0;
+
   const nMembers = team?.memberNames.length ?? 0;
+  const cap = cfg?.maxPerMember ?? DEFAULT_CAP;
+  const counts = team?.memberNames.map((_, i) => team.memberCounts?.[i] ?? 0) ?? [];
+  const doneByHolder = team ? counts[team.holder] ?? 0 : 0;
+  const capReached = doneByHolder >= cap;
+  const canPass = capReached || (passMsLeft !== null && passMsLeft <= 0);
   const holderName = team?.memberNames[team.holder] ?? "";
   const nextName = team ? team.memberNames[(team.holder + 1) % Math.max(1, nMembers)] : "";
-
-  function freeze() {
-    setFrozen({
-      legLeft: legMsLeft ?? 0,
-      totalLeft: totalMsLeft,
-      legStart: legStartMs,
-      bonus,
-    });
-  }
-
-  // release the frozen clock once the server has credited the pause (or after 3s)
-  useEffect(() => {
-    if (!frozen || judging) return;
-    if (legStartMs !== frozen.legStart || bonus !== frozen.bonus) {
-      setFrozen(null);
-      return;
-    }
-    const t = setTimeout(() => setFrozen(null), 3000);
-    return () => clearTimeout(t);
-  }, [frozen, judging, legStartMs, bonus]);
 
   // ---------- question ----------
   useEffect(() => {
@@ -206,12 +225,20 @@ export default function RelayPage() {
         setInputText(r.question.sampleInput);
         setRunOut(null);
         setCheckResults(null);
+        // the clock restarts only once the student can actually see the new question
+        if (resumeAfterQuestion.current) {
+          resumeAfterQuestion.current = false;
+          afterPaint(() => {
+            resume();
+            setAwaitNext(false);
+          });
+        }
       })
       .catch(() => {});
     return () => {
       alive = false;
     };
-  }, [arena, teamId, team?.qIndex, cfg?.roundId]);
+  }, [arena, teamId, team?.qIndex, cfg?.roundId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // the code lives in this browser only (survives a reload), never in the database
   const storeKey =
@@ -275,14 +302,24 @@ export default function RelayPage() {
   }
 
   const errText = (e: unknown, fallback: string) => {
-    const m = (e as Error).message;
-    if (m === "time-up") return "Time is up.";
-    if (m === "handoff") return "Wait for the seat swap to finish.";
-    return fallback;
+    switch ((e as Error).message) {
+      case "time-up":
+        return "Time is up.";
+      case "handoff":
+        return "Wait for the seat swap to finish.";
+      case "member-done":
+        return "This member has used all their questions. Pass the baton.";
+      case "too-soon":
+        return "It is too early to pass the baton.";
+      case "no-next":
+        return "No other member has questions left.";
+      default:
+        return fallback;
+    }
   };
 
   // ---------- actions ----------
-  // Run: your own input, unlimited, nothing stored
+  // Run: your own input, unlimited, nothing stored, clock keeps running
   async function onRun() {
     if (busy || !question) return;
     setBusy("run");
@@ -300,10 +337,9 @@ export default function RelayPage() {
     setBusy("");
   }
 
-  // Check tests: sample + hidden tests, unlimited, nothing stored. Clock is paused.
+  // Check tests: the clock is paused on the server until the results are on screen
   async function onCheck() {
     if (busy || !teamId) return;
-    freeze();
     setBusy("check");
     setCheckResults(null);
     setNotice(null);
@@ -329,14 +365,15 @@ export default function RelayPage() {
       setNotice({ kind: "bad", text: errText(e, "Could not check the tests. Try again.") });
     }
     setBusy("");
+    afterPaint(resume);
   }
 
-  // Submit: the only action that is scored. Clock is paused.
+  // Submit: the only action that is scored
   async function onSubmit() {
     if (busy || !question || !teamId) return;
-    freeze();
     setBusy("submit");
     setNotice(null);
+    let waitForNext = false;
     try {
       const { token, inputs } = await api<{ token: string; inputs: string[] }>("/api/relay", {
         action: "start",
@@ -349,12 +386,17 @@ export default function RelayPage() {
         token,
         outputs: results.map((r) => r.output),
       });
+      if (res.ok && !res.finished) {
+        waitForNext = true; // the clock stays paused until the next question shows
+        resumeAfterQuestion.current = true;
+        setAwaitNext(true);
+      }
       setNotice(
         res.ok
           ? {
               kind: "ok",
               text: res.finished
-                ? "Correct! Your team has finished every question."
+                ? "Correct! Your team has finished."
                 : "Correct! Here is the next question.",
             }
           : {
@@ -369,6 +411,7 @@ export default function RelayPage() {
       });
     }
     setBusy("");
+    if (!waitForNext) afterPaint(resume);
   }
 
   async function onSkip() {
@@ -376,12 +419,18 @@ export default function RelayPage() {
     setConfirmSkip(false);
     setBusy("skip");
     setNotice(null);
+    let waitForNext = false;
     try {
       const r = await api<{ ok: boolean; finished: boolean }>("/api/relay", {
         action: "skip",
         teamId,
         qIndex: team.qIndex,
       });
+      if (!r.finished) {
+        waitForNext = true;
+        resumeAfterQuestion.current = true;
+        setAwaitNext(true);
+      }
       setNotice({
         kind: "ok",
         text: r.finished ? "Skipped. That was the last question." : "Skipped. Here is the next question.",
@@ -390,6 +439,7 @@ export default function RelayPage() {
       setNotice({ kind: "bad", text: errText(e, "Could not skip. Try again.") });
     }
     setBusy("");
+    if (!waitForNext) afterPaint(resume);
   }
 
   async function onPass() {
@@ -397,8 +447,20 @@ export default function RelayPage() {
     setBusy("pass");
     try {
       await api("/api/relay", { action: "pass", mode: "early", teamId });
-    } catch {
-      setNotice({ kind: "bad", text: "Could not pass the baton yet." });
+    } catch (e) {
+      setNotice({ kind: "bad", text: errText(e, "Could not pass the baton yet.") });
+    }
+    setBusy("");
+  }
+
+  async function onEnd() {
+    if (busy || !teamId) return;
+    setConfirmEnd(false);
+    setBusy("end");
+    try {
+      await api("/api/relay", { action: "end", teamId });
+    } catch (e) {
+      setNotice({ kind: "bad", text: errText(e, "Could not end the section. Try again.") });
     }
     setBusy("");
   }
@@ -430,7 +492,8 @@ export default function RelayPage() {
         </div>
         <p className="mx-auto mt-4 max-w-md text-sm text-slate-600">
           {cfg.name}: {cfg.durationMin} minutes in total, {Math.round((cfg.legSec / 60) * 10) / 10}{" "}
-          minutes per member. Sit down in the order above and wait for the organiser to start.
+          minutes per turn, at most {cap} questions per member. Sit down in the order above and wait
+          for the organiser to start.
         </p>
       </div>
     );
@@ -440,7 +503,11 @@ export default function RelayPage() {
         <div className={card}>
           <h2 className="text-xl font-bold text-slate-900">{team.name}</h2>
           <p className="mt-1 text-sm text-slate-700">
-            {finished ? "Your team went through every question. " : "The round is over. "}
+            {team.endedEarly
+              ? "Your team ended the section."
+              : finished
+              ? "Your team went through every question."
+              : "The round is over."}
           </p>
           <div className="mt-4 grid grid-cols-3 gap-3 text-center">
             {[
@@ -494,7 +561,8 @@ export default function RelayPage() {
       </div>
     );
   } else {
-    const locked = phase !== "active" || handoff || !!busy;
+    const locked = phase !== "active" || handoff || !!busy || awaitNext || capReached;
+    const actionsOff = !!busy || handoff || awaitNext || capReached;
     const lowTotal = totalMsLeft < 60_000;
     const lowLeg = (legMsLeft ?? Infinity) < 30_000;
     body = (
@@ -521,7 +589,7 @@ export default function RelayPage() {
             </div>
             <div className="text-right">
               <p className="text-xs text-slate-500">
-                {frozen ? "Round time (paused)" : "Round time left"}
+                {paused ? "Round time (clock paused)" : "Round time left"}
               </p>
               <p
                 className={`font-mono text-2xl font-bold tabular-nums ${
@@ -535,41 +603,69 @@ export default function RelayPage() {
         </div>
 
         {/* who is coding */}
-        <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-teal-200 bg-gradient-to-r from-teal-50 to-white px-5 py-4">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-widest text-teal-700">Now coding</p>
-            <p className="text-xl font-bold text-slate-900">{holderName}</p>
-            {nMembers > 1 && (
+        <div className="rounded-2xl border border-teal-200 bg-gradient-to-r from-teal-50 to-white px-5 py-4">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-widest text-teal-700">Now coding</p>
+              <p className="text-xl font-bold text-slate-900">{holderName}</p>
               <p className="text-xs text-slate-600">
-                Next up: <b>{nextName}</b>
+                Questions used: <b>{doneByHolder}</b> of {cap}
+                {nMembers > 1 && (
+                  <>
+                    {" "}
+                    · Next up: <b>{nextName}</b>
+                  </>
+                )}
               </p>
-            )}
+            </div>
+            <div className="flex items-center gap-5">
+              <div className="text-right">
+                <p className="text-xs text-slate-500">{paused ? "Turn (paused)" : "Turn ends in"}</p>
+                <p
+                  className={`font-mono text-3xl font-bold tabular-nums ${
+                    lowLeg ? "text-red-600" : "text-slate-900"
+                  }`}
+                >
+                  {fmt(legMsLeft ?? 0)}
+                </p>
+              </div>
+              <div className="flex flex-col items-end gap-1">
+                <button
+                  className={capReached ? btn : btnGhost}
+                  onClick={onPass}
+                  disabled={!!busy || awaitNext || handoff || nMembers < 2 || !canPass}
+                >
+                  Pass the baton
+                </button>
+                {!canPass && passMsLeft !== null && (
+                  <span className="text-xs text-slate-500">Early pass in {fmt(passMsLeft)}</span>
+                )}
+              </div>
+            </div>
           </div>
-          <div className="flex items-center gap-5">
-            <div className="text-right">
-              <p className="text-xs text-slate-500">{frozen ? "Turn (paused)" : "Turn ends in"}</p>
-              <p
-                className={`font-mono text-3xl font-bold tabular-nums ${
-                  lowLeg ? "text-red-600" : "text-slate-900"
+          <div className="mt-3 flex flex-wrap gap-2 border-t border-teal-100 pt-3">
+            {team.memberNames.map((m, i) => (
+              <span
+                key={m}
+                className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                  i === team.holder
+                    ? "bg-teal-700 text-white"
+                    : counts[i] >= cap
+                    ? "bg-slate-200 text-slate-500 line-through"
+                    : "bg-white text-slate-700 ring-1 ring-slate-200"
                 }`}
               >
-                {fmt(legMsLeft ?? 0)}
-              </p>
-            </div>
-            <div className="flex flex-col items-end gap-1">
-              <button
-                className={btnGhost}
-                onClick={onPass}
-                disabled={!!busy || nMembers < 2 || (passMsLeft !== null && passMsLeft > 0)}
-              >
-                Pass the baton
-              </button>
-              {passMsLeft !== null && passMsLeft > 0 && (
-                <span className="text-xs text-slate-500">Early pass in {fmt(passMsLeft)}</span>
-              )}
-            </div>
+                {m} {counts[i]}/{cap}
+              </span>
+            ))}
           </div>
         </div>
+
+        {capReached && (
+          <p role="status" className="rounded-xl bg-amber-50 px-4 py-3 text-sm font-medium text-amber-900">
+            {holderName} has used all {cap} questions. Pass the baton to the next member.
+          </p>
+        )}
 
         <div className="grid gap-4 lg:grid-cols-5">
           {/* question */}
@@ -612,12 +708,8 @@ export default function RelayPage() {
           {/* editor */}
           <div className={`${card} lg:col-span-3`}>
             <div className="mb-2 flex items-center justify-between">
-              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                main.py
-              </p>
-              {phase !== "active" || handoff ? (
-                <span className="text-xs font-medium text-amber-700">Editor locked</span>
-              ) : null}
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">main.py</p>
+              {locked && !busy && <span className="text-xs font-medium text-amber-700">Editor locked</span>}
             </div>
             <textarea
               ref={taRef}
@@ -647,23 +739,23 @@ export default function RelayPage() {
             </label>
 
             <div className="mt-4 flex flex-wrap items-center gap-2">
-              <button className={btnGhost} onClick={onRun} disabled={!!busy || locked}>
+              <button className={btnGhost} onClick={onRun} disabled={actionsOff}>
                 {busy === "run" ? "Running…" : "Run"}
               </button>
-              <button className={btnGhost} onClick={onCheck} disabled={!!busy || handoff}>
+              <button className={btnGhost} onClick={onCheck} disabled={actionsOff}>
                 Check tests
               </button>
-              <button className={btn} onClick={onSubmit} disabled={!!busy || handoff}>
+              <button className={btn} onClick={onSubmit} disabled={actionsOff}>
                 Submit
               </button>
               <span className="flex-1" />
-              <button className={btnDanger} onClick={() => setConfirmSkip(true)} disabled={!!busy || handoff}>
+              <button className={btnDanger} onClick={() => setConfirmSkip(true)} disabled={actionsOff}>
                 Skip question
               </button>
             </div>
             <p className="mt-2 text-xs text-slate-500">
-              Run and Check tests are free. Only Submit counts, and the clock stops while your code is
-              being judged. A skipped question cannot be opened again.
+              Run and Check tests are free. Only Submit counts. The clock stops while your code is being
+              judged and until the next screen is showing. A skipped question cannot be opened again.
             </p>
 
             {runOut && (
@@ -723,8 +815,19 @@ export default function RelayPage() {
           </div>
         </div>
 
-        {/* judging / skipping overlay */}
-        {(judging || busy === "skip") && (
+        {/* end the section */}
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-red-100 bg-white px-5 py-4">
+          <p className="max-w-xl text-sm text-slate-600">
+            Done for today? Ending the section stops your team for good. It cannot be undone, and
+            unanswered questions stay unsolved.
+          </p>
+          <button className={btnDanger} onClick={() => setConfirmEnd(true)} disabled={!!busy || awaitNext}>
+            End section
+          </button>
+        </div>
+
+        {/* judging / skipping / loading-next overlay */}
+        {(judging || busy === "skip" || awaitNext) && (
           <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/70 backdrop-blur-sm">
             <div className="flex w-80 flex-col items-center gap-4 rounded-2xl bg-white p-8 text-center shadow-2xl">
               <Spinner size={64} />
@@ -733,13 +836,11 @@ export default function RelayPage() {
                   ? "Judging your submission…"
                   : busy === "check"
                   ? "Running the tests…"
-                  : "Moving to the next question…"}
+                  : "Loading the next question…"}
               </p>
-              {judging && (
-                <p className="text-sm text-slate-600">
-                  Your timer is paused. It resumes when the result arrives.
-                </p>
-              )}
+              <p className="text-sm text-slate-600">
+                Your timer is paused. It resumes when the next screen is showing.
+              </p>
             </div>
           </div>
         )}
@@ -748,9 +849,7 @@ export default function RelayPage() {
         {handoff && (
           <div className="fixed inset-0 z-[60] flex items-center justify-center bg-teal-900/95 px-4 text-center text-white">
             <div>
-              <p className="text-sm font-semibold uppercase tracking-[0.3em] text-teal-200">
-                Swap seats
-              </p>
+              <p className="text-sm font-semibold uppercase tracking-[0.3em] text-teal-200">Swap seats</p>
               <p className="mt-4 text-4xl font-bold sm:text-5xl">{holderName} is up next</p>
               <p className="mt-10 font-mono text-[9rem] font-bold leading-none tabular-nums sm:text-[12rem]">
                 {Math.ceil(handoffMsLeft / 1000)}
@@ -766,8 +865,8 @@ export default function RelayPage() {
             <div className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl">
               <h3 className="text-lg font-bold text-slate-900">Skip this question?</h3>
               <p className="mt-2 text-sm text-slate-600">
-                You will move on to the next question and cannot come back to this one. It counts as a
-                skip, which is used as a tie-breaker in the ranking.
+                You will move on and cannot come back to this one. It counts as a skip and as one of{" "}
+                {holderName}&apos;s {cap} questions.
               </p>
               <div className="mt-5 flex justify-end gap-2">
                 <button className={btnGhost} onClick={() => setConfirmSkip(false)}>
@@ -775,6 +874,30 @@ export default function RelayPage() {
                 </button>
                 <button className={btn} onClick={onSkip}>
                   Yes, skip
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* end confirmation */}
+        {confirmEnd && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/60 px-4">
+            <div className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl">
+              <h3 className="text-lg font-bold text-red-700">End the section for your team?</h3>
+              <p className="mt-2 text-sm text-slate-600">
+                This is permanent. Nobody on your team can answer any more questions, and you cannot
+                undo it.
+              </p>
+              <div className="mt-5 flex justify-end gap-2">
+                <button className={btnGhost} onClick={() => setConfirmEnd(false)}>
+                  Cancel
+                </button>
+                <button
+                  className="rounded-lg bg-red-700 px-4 py-2 text-sm font-semibold text-white hover:bg-red-800"
+                  onClick={onEnd}
+                >
+                  End for good
                 </button>
               </div>
             </div>

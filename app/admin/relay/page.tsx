@@ -30,6 +30,7 @@ interface Cfg {
   durationMin: number;
   legSec: number;
   minPassSec: number;
+  maxPerMember?: number;
   leaderboard: unknown[] | null;
 }
 interface Student {
@@ -115,6 +116,8 @@ const teamDoc = (name: string, login: Student, memberNames: string[]) => ({
   uid: login.id,
   username: login.username,
   memberNames,
+  memberCounts: [],
+  endedEarly: false,
   order: [],
   qIndex: 0,
   holder: 0,
@@ -148,6 +151,7 @@ export default function AdminRelayPage() {
   const [durationMin, setDurationMin] = useState(45);
   const [legSec, setLegSec] = useState(300);
   const [minPassSec, setMinPassSec] = useState(60);
+  const [maxPerMember, setMaxPerMember] = useState(5);
 
   // teams
   const [bulk, setBulk] = useState("");
@@ -231,6 +235,7 @@ export default function AdminRelayPage() {
         durationMin: Math.max(1, durationMin),
         legSec: Math.max(30, legSec),
         minPassSec: Math.max(0, Math.min(minPassSec, legSec)),
+        maxPerMember: Math.max(1, maxPerMember),
         leaderboard: null,
       });
       flash("New round created. Teams are in the lobby.");
@@ -260,6 +265,8 @@ export default function AdminRelayPage() {
           judgingSince: null,
           solvedIds: [],
           lastSolveAt: null,
+          memberCounts: t.memberNames.map(() => 0),
+          endedEarly: false,
           status: "active",
         });
       }
@@ -491,10 +498,10 @@ export default function AdminRelayPage() {
           {cfg?.roundId && (
             <p className="mt-4 rounded-lg bg-slate-50 px-4 py-3 text-sm text-slate-700">
               <b>{cfg.name}</b>: {cfg.durationMin} min total, {cfg.legSec}s per member, early pass
-              after {cfg.minPassSec}s.
+              after {cfg.minPassSec}s, max {cfg.maxPerMember ?? 5} questions per member.
             </p>
           )}
-          <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
             <label className={labelCls}>
               Name
               <input className={field} value={name} onChange={(e) => setName(e.target.value)} />
@@ -510,6 +517,10 @@ export default function AdminRelayPage() {
             <label className={labelCls}>
               Min seconds before early pass
               <input type="number" className={field} value={minPassSec} onChange={(e) => setMinPassSec(Number(e.target.value))} />
+            </label>
+            <label className={labelCls}>
+              Max questions per member
+              <input type="number" className={field} value={maxPerMember} onChange={(e) => setMaxPerMember(Number(e.target.value))} />
             </label>
           </div>
           <div className="mt-5 flex flex-wrap gap-3">
