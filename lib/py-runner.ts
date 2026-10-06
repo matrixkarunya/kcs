@@ -114,4 +114,9 @@ export function runPython(
   const job = chain.then(() => runOnce(code, inputs, timeoutMs));
   chain = job.catch(() => undefined);
   return job;
+}export function warmUpPython(): Promise<void> {
+  return getWorker().then(
+    () => undefined,
+    () => undefined
+  );
 }
