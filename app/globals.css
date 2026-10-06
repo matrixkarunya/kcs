@@ -8,7 +8,7 @@
 }
 
 :root {
-  color-scheme: light; /* the app is light only; stops dark-mode text colours leaking in */
+  color-scheme: light;
   --background: #eef2f6;
   --foreground: #101828;
 }
@@ -20,9 +20,11 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* form controls inherit colour in Tailwind v4, so always set a readable one */
-textarea,
-input,
-select {
-  color: #101828;
+/* default colour for form controls, in the base layer so utility classes can override it */
+@layer base {
+  textarea,
+  input,
+  select {
+    color: #101828;
+  }
 }
