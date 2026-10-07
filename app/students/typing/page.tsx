@@ -49,6 +49,33 @@ const btnGhost =
 
 /* ---------- small components ---------- */
 
+function Spinner({ className = "h-4 w-4" }: { className?: string }) {
+  return (
+    <svg
+      className={`animate-spin ${className}`}
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden="true"
+    >
+      <circle
+        cx="12"
+        cy="12"
+        r="10"
+        stroke="currentColor"
+        strokeWidth="4"
+        className="opacity-25"
+      />
+      <path
+        d="M4 12a8 8 0 0 1 8-8"
+        stroke="currentColor"
+        strokeWidth="4"
+        strokeLinecap="round"
+        className="opacity-90"
+      />
+    </svg>
+  );
+}
+
 function Pill({
   children,
   tone = "slate",
@@ -292,6 +319,7 @@ export default function TypingPage() {
   } | null>(null);
   const [pending, setPending] = useState<FinishPayload | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [starting, setStarting] = useState(false); // begin() request in flight
   const [practice, setPractice] = useState(false);
   const [practiceRun, setPracticeRun] = useState(0);
   const [practiceUsed, setPracticeUsed] = useState(0);
@@ -347,6 +375,7 @@ export default function TypingPage() {
     setResult(null);
     setPending(null);
     setConfirmOpen(false);
+    setStarting(false);
     setError("");
     setAttempt("loading");
     if (!uid || !roundId) {
@@ -397,6 +426,7 @@ export default function TypingPage() {
   const begin = useCallback(async () => {
     if (beginning.current || !roundId) return;
     beginning.current = true;
+    setStarting(true);
     setError("");
     try {
       const r = await api<{ passage: string; durationSec: number }>(
@@ -405,13 +435,16 @@ export default function TypingPage() {
       );
       setSession({ passage: r.passage, durationSec: r.durationSec });
       setAttempt("started");
+      setStarting(false);
     } catch (e) {
       const err = e as { status?: number; message?: string };
       if (err.status === 425) {
+        // keep the loader on while we retry
         await new Promise((res) => setTimeout(res, 600));
         beginning.current = false;
         return begin();
       }
+      setStarting(false);
       if (err.message === "already-attempted") {
         setAttempt("started");
       } else if (err.message === "round-not-running") {
@@ -599,7 +632,8 @@ export default function TypingPage() {
           </div>
         ) : submitting ? (
           <div className={card}>
-            <p className="text-sm font-medium text-slate-600">
+            <p className="flex items-center gap-2 text-sm font-medium text-slate-600">
+              <Spinner className="h-4 w-4 text-teal-600" />
               Sending your result…
             </p>
           </div>
@@ -676,8 +710,12 @@ export default function TypingPage() {
                   <strong>only</strong> scored attempt.
                 </p>
               </div>
-            ) : sawCountdown.current ? (
-              <p className="mt-4 text-sm font-medium text-slate-600">
+            ) : sawCountdown.current && !error ? (
+              <p
+                className="mt-4 flex items-center gap-2 text-sm font-medium text-slate-600"
+                role="status"
+              >
+                <Spinner className="h-4 w-4 text-teal-600" />
                 Starting…
               </p>
             ) : (
@@ -689,9 +727,27 @@ export default function TypingPage() {
                 <button
                   className={`${btnPrimary} mt-5`}
                   onClick={() => setConfirmOpen(true)}
+                  disabled={starting}
+                  aria-busy={starting}
                 >
-                  Start my test
+                  {starting ? (
+                    <>
+                      <Spinner />
+                      Starting…
+                    </>
+                  ) : (
+                    "Start my test"
+                  )}
                 </button>
+                {starting && (
+                  <p
+                    className="mt-3 text-sm text-slate-500"
+                    role="status"
+                  >
+                    Loading your passage, please don&apos;t refresh or leave
+                    this page.
+                  </p>
+                )}
               </>
             )}
 
@@ -703,7 +759,8 @@ export default function TypingPage() {
                 {error}
                 <button
                   onClick={retryBegin}
-                  className="ml-3 font-semibold underline"
+                  disabled={starting}
+                  className="ml-3 font-semibold underline disabled:opacity-50"
                 >
                   Retry
                 </button>
@@ -782,7 +839,7 @@ export default function TypingPage() {
             </div>
             <button
               className={btnGhost}
-              disabled={practiceLeft <= 0}
+              disabled={practiceLeft <= 0 || starting}
               onClick={openPractice}
             >
               {practiceLeft > 0 ? "Start practice" : "No attempts left"}

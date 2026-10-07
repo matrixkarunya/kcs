@@ -3,7 +3,7 @@ import { Timestamp } from "firebase-admin/firestore";
 import { adminDb } from "@/lib/firebase-admin";
 import { ApiError, errorResponse, requireStudent } from "@/lib/api-auth";
 import { analyzeTiming, getPassageById } from "@/lib/typing-server";
-import { scoreTyping } from "@/lib/typing";
+import { detailTyping, scoreTyping } from "@/lib/typing";
 
 export const dynamic = "force-dynamic";
 
@@ -68,6 +68,9 @@ export async function POST(req: Request) {
     const score = scoreTyping(passage.text, typedKept, elapsedMs);
     if (score.grossWpm > 180) flags.push("very-high-wpm");
 
+    // extra detail for the admin dashboard (never sent to the student)
+    const detail = detailTyping(passage.text, typedKept, timesKept, durationMs);
+
     const strikes =
       (await db.doc(`sessions/${user.uid}`).get()).data()?.strikes ?? 0;
 
@@ -80,13 +83,14 @@ export async function POST(req: Request) {
         status: "submitted",
         submittedAt: Timestamp.fromMillis(nowMs),
         ...score,
+        ...detail,
         flags,
         review: flags.length ? "flagged" : "valid",
         strikes,
       });
     });
 
-    // flags are never sent back to the student
+    // flags and detail are never sent back to the student
     return NextResponse.json(score);
   } catch (e) {
     return errorResponse(e);
