@@ -1,4 +1,3 @@
-//app/admin/relay/page.tsx
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -111,15 +110,11 @@ function shuffle<T>(arr: T[]): T[] {
 const orderFor = (qs: BankQuestion[]) =>
   [1, 2, 3].flatMap((t) => shuffle(qs.filter((q) => q.tier === t)).map((q) => q.id));
 
-// One login per team. Member names are just the people's details.
-const teamDoc = (name: string, login: Student, memberNames: string[]) => ({
-  name,
-  uid: login.id,
-  username: login.username,
-  memberNames,
-  memberCounts: [],
+// Every score and progress field of a team, back to its starting value
+const clearedScore = () => ({
+  memberCounts: [] as number[],
   endedEarly: false,
-  order: [],
+  order: [] as string[],
   qIndex: 0,
   holder: 0,
   legStartedAt: null,
@@ -128,13 +123,26 @@ const teamDoc = (name: string, login: Student, memberNames: string[]) => ({
   skipped: 0,
   bonusMs: 0,
   judgingSince: null,
-  solvedIds: [],
+  solvedIds: [] as string[],
   lastSolveAt: null,
   status: "waiting",
 });
 
+// One login per team. Member names are just the people's details.
+const teamDoc = (name: string, login: Student, memberNames: string[]) => ({
+  name,
+  uid: login.id,
+  username: login.username,
+  memberNames,
+  ...clearedScore(),
+});
+
 const trimEnd = (s: string) => s.replace(/\s+$/, "");
 const mmss = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+
+// True when two members of the same team share a name (case-insensitive)
+const hasDuplicateNames = (names: string[]) =>
+  new Set(names.map((n) => n.toLowerCase())).size !== names.length;
 
 /* -------------------------------- page -------------------------------- */
 
@@ -290,6 +298,70 @@ export default function AdminRelayPage() {
     }
   }
 
+  // ---------- reset scores ----------
+  // Clears every team's score. The round goes back to the lobby with a new internal
+  // id, so code saved on the team computers for the old round can't come back.
+  async function resetAllScores() {
+    if (teams.length === 0) return flash("There are no teams, so there are no scores to reset.", "bad");
+    const live = status === "running";
+    const ok = window.confirm(
+      live
+        ? "The round is running. This stops it, deletes every team's score and puts the round back in the lobby. This cannot be undone. Continue?"
+        : "Delete every team's score and put the round back in the lobby? This cannot be undone."
+    );
+    if (!ok) return;
+    try {
+      const batch = writeBatch(db);
+      for (const t of teams) batch.update(doc(db, "relayTeams", t.id), clearedScore());
+      if (cfg?.roundId) {
+        batch.update(cfgRef, {
+          roundId: `r${Date.now()}`,
+          status: "lobby",
+          startedAt: null,
+          leaderboard: null,
+        });
+      }
+      await batch.commit();
+      flash(
+        cfg?.roundId
+          ? `All scores deleted for ${teams.length} teams. The round is back in the lobby, press Start round when ready.`
+          : `All scores deleted for ${teams.length} teams.`
+      );
+      loadTeams();
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  // Clears one team. During a running round the team restarts from question 1.
+  async function resetTeam(t: TeamRow) {
+    const live = status === "running";
+    const ok = window.confirm(
+      live
+        ? `Restart "${t.name}" from question 1 with a fresh question order? Their score is deleted.`
+        : `Delete the score of "${t.name}"?`
+    );
+    if (!ok) return;
+    try {
+      if (live) {
+        if (!bank || bank.length === 0) return flash("The question bank is empty.", "bad");
+        await updateDoc(doc(db, "relayTeams", t.id), {
+          ...clearedScore(),
+          order: orderFor(bank),
+          legStartedAt: serverTimestamp(),
+          memberCounts: t.memberNames.map(() => 0),
+          status: "active",
+        });
+      } else {
+        await updateDoc(doc(db, "relayTeams", t.id), clearedScore());
+      }
+      flash(`"${t.name}" was reset.`);
+      loadTeams();
+    } catch (e) {
+      fail(e);
+    }
+  }
+
   // ---------- teams ----------
   // One line per team:  Team name | Member 1, Member 2, Member 3
   async function bulkAdd() {
@@ -306,6 +378,9 @@ export default function AdminRelayPage() {
         const memberNames = rawMembers.split(",").map((s) => s.trim()).filter(Boolean);
         if (!tName || memberNames.length === 0) {
           return flash(`Line ${i + 1}: use  Team name | Member 1, Member 2, Member 3`, "bad");
+        }
+        if (hasDuplicateNames(memberNames)) {
+          return flash(`Line ${i + 1}: member names must be different.`, "bad");
         }
         batch.set(doc(collection(db, "relayTeams")), teamDoc(tName, freeLogins[i], memberNames));
       }
@@ -324,6 +399,9 @@ export default function AdminRelayPage() {
     if (!teamName.trim()) return flash("Give the team a name.", "bad");
     if (!chosen) return flash("Pick a login for the team.", "bad");
     if (memberNames.length === 0) return flash("Enter at least one member name.", "bad");
+    if (hasDuplicateNames(memberNames)) {
+      return flash("Member names in a team must be different.", "bad");
+    }
     try {
       await setDoc(doc(collection(db, "relayTeams")), teamDoc(teamName.trim(), chosen, memberNames));
       setTeamName("");
@@ -602,8 +680,11 @@ export default function AdminRelayPage() {
                       </code>
                     </p>
                     <div className="mt-1 flex flex-wrap gap-1">
-                      {t.memberNames.map((m) => (
-                        <span key={m} className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-700">
+                      {t.memberNames.map((m, i) => (
+                        <span
+                          key={`${i}-${m}`}
+                          className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-700"
+                        >
                           {m}
                         </span>
                       ))}
@@ -630,8 +711,16 @@ export default function AdminRelayPage() {
               <button className={btnGhost} onClick={loadTeams}>Refresh</button>
               <button className={btn} onClick={publish} disabled={ranked.length === 0}>Publish top 5</button>
               <button className={btnGhost} onClick={unpublish} disabled={!cfg?.leaderboard}>Unpublish</button>
+              <button className={btnDanger} onClick={resetAllScores} disabled={teams.length === 0}>
+                Reset all scores
+              </button>
             </div>
           </div>
+          <p className="mt-3 text-xs text-slate-500">
+            Reset all scores deletes every team's score and puts the round back in the lobby. The Reset
+            button on a row clears just that team (if the round is running, the team restarts from
+            question 1; code they already typed on their computer may reappear).
+          </p>
           <div className="mt-4 overflow-x-auto rounded-xl border border-slate-200">
             <table className="w-full text-left text-sm">
               <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
@@ -644,12 +733,13 @@ export default function AdminRelayPage() {
                   <th className="px-3 py-2 font-semibold">Skipped</th>
                   <th className="px-3 py-2 font-semibold">Last solve</th>
                   <th className="px-3 py-2 font-semibold">Status</th>
+                  <th className="px-3 py-2 font-semibold" />
                 </tr>
               </thead>
               <tbody className="text-slate-800">
                 {ranked.length === 0 && (
                   <tr>
-                    <td colSpan={8} className="px-3 py-4 text-slate-500">No teams yet.</td>
+                    <td colSpan={9} className="px-3 py-4 text-slate-500">No teams yet.</td>
                   </tr>
                 )}
                 {ranked.map((t, i) => (
@@ -667,6 +757,9 @@ export default function AdminRelayPage() {
                     <td className="px-3 py-2 font-mono">{t.lastSolveMs ? mmss(secs(t)) : "-"}</td>
                     <td className="px-3 py-2">
                       <Pill text={t.status} cls={STATUS_STYLE[t.status] ?? STATUS_STYLE.waiting} />
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <button className={btnDanger} onClick={() => resetTeam(t)}>Reset</button>
                     </td>
                   </tr>
                 ))}
