@@ -20,7 +20,13 @@ import {
 import { db } from "@/lib/firebase";
 import AppHeader from "@/components/app-header";
 import { runPython } from "@/lib/py-runner";
-import { BankQuestion, QType, Tier, TIER_LABEL, TYPE_LABEL } from "@/lib/relay";
+import {
+  BankQuestion,
+  QType,
+  Tier,
+  TIER_LABEL,
+  TYPE_LABEL,
+} from "@/lib/relay";
 
 interface Cfg {
   roundId: string | null;
@@ -48,6 +54,7 @@ interface TeamRow {
   wrong: number;
   skipped: number;
   lastSolveMs: number;
+  elapsedMs: number; // active solving time on the team's own clock
   status: string;
 }
 
@@ -125,6 +132,7 @@ const clearedScore = () => ({
   judgingSince: null,
   solvedIds: [] as string[],
   lastSolveAt: null,
+  lastSolveElapsedMs: null,
   status: "waiting",
 });
 
@@ -206,6 +214,12 @@ export default function AdminRelayPage() {
           wrong: x.wrong ?? 0,
           skipped: x.skipped ?? 0,
           lastSolveMs: x.lastSolveAt?.toMillis?.() ?? 0,
+          // saved at every correct answer; older teams fall back to a close estimate
+          elapsedMs:
+            x.lastSolveElapsedMs ??
+            (x.lastSolveAt?.toMillis?.() && x.startedAt?.toMillis?.()
+              ? Math.max(0, x.lastSolveAt.toMillis() - x.startedAt.toMillis() - (x.bonusMs ?? 0))
+              : 0),
           status: x.status,
         } as TeamRow;
       })
@@ -274,6 +288,7 @@ export default function AdminRelayPage() {
           judgingSince: null,
           solvedIds: [],
           lastSolveAt: null,
+          lastSolveElapsedMs: null,
           memberCounts: t.memberNames.map(() => 0),
           endedEarly: false,
           status: "active",
@@ -481,7 +496,6 @@ export default function AdminRelayPage() {
   }
 
   // ---------- results ----------
-  const startMs = cfg?.startedAt?.toMillis() ?? 0;
   const ranked = useMemo(
     () =>
       [...teams].sort(
@@ -489,12 +503,11 @@ export default function AdminRelayPage() {
           b.solved - a.solved ||
           a.wrong - b.wrong ||
           a.skipped - b.skipped ||
-          (a.lastSolveMs || Number.MAX_SAFE_INTEGER) - (b.lastSolveMs || Number.MAX_SAFE_INTEGER)
+          (a.elapsedMs || Number.MAX_SAFE_INTEGER) - (b.elapsedMs || Number.MAX_SAFE_INTEGER)
       ),
     [teams]
   );
-  const secs = (t: TeamRow) =>
-    t.lastSolveMs && startMs ? Math.round((t.lastSolveMs - startMs) / 1000) : 0;
+  const secs = (t: TeamRow) => Math.round(t.elapsedMs / 1000);
 
   async function publish() {
     try {
@@ -705,7 +718,7 @@ export default function AdminRelayPage() {
             <SectionTitle
               n={3}
               title="Results"
-              hint="Not live, to keep Firebase usage low. Press Refresh. Ranked by solved, then fewest wrong submits, then fewest skips, then earliest last solve."
+              hint="Not live, to keep Firebase usage low. Press Refresh. Ranked by solved, then fewest wrong submits, then fewest skips, then the earliest last solve, counted on each team's own clock (from its Start relay, without paused time)."
             />
             <div className="flex flex-wrap gap-2">
               <button className={btnGhost} onClick={loadTeams}>Refresh</button>
@@ -754,7 +767,7 @@ export default function AdminRelayPage() {
                     <td className="px-3 py-2 font-semibold text-teal-700">{t.solved}</td>
                     <td className="px-3 py-2 text-red-700">{t.wrong}</td>
                     <td className="px-3 py-2">{t.skipped}</td>
-                    <td className="px-3 py-2 font-mono">{t.lastSolveMs ? mmss(secs(t)) : "-"}</td>
+                    <td className="px-3 py-2 font-mono">{t.elapsedMs ? mmss(secs(t)) : "-"}</td>
                     <td className="px-3 py-2">
                       <Pill text={t.status} cls={STATUS_STYLE[t.status] ?? STATUS_STYLE.waiting} />
                     </td>
