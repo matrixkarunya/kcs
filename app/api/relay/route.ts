@@ -4,6 +4,7 @@ import { adminDb } from "@/lib/firebase-admin";
 import { ApiError, errorResponse, requireStudent } from "@/lib/api-auth";
 import { getBank, signToken, verifyToken } from "@/lib/relay-server";
 import { normalizeOutput } from "@/lib/relay";
+import type { BankQuestion } from "@/lib/relay";
 
 export const dynamic = "force-dynamic";
 
@@ -66,6 +67,23 @@ function settle(cur: Team, now: number): Record<string, unknown> {
 const countsOf = (t: Team) =>
   Array.from({ length: Math.max(1, t.memberNames.length) }, (_, i) => t.memberCounts?.[i] ?? 0);
 
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// Easy, then medium, then hard; shuffled inside each tier. Only questions
+// whose outputs are computed are used (falls back to all if none are ready).
+function buildOrder(bank: BankQuestion[]): string[] {
+  const ready = bank.filter((q) => q.sampleOutput && q.hiddenOutputs?.length);
+  const pool = ready.length ? ready : bank;
+  return [1, 2, 3].flatMap((t) => shuffle(pool.filter((q) => q.tier === t)).map((q) => q.id));
+}
+
 export async function POST(req: Request) {
   try {
     const user = await requireStudent(req);
@@ -82,7 +100,7 @@ export async function POST(req: Request) {
       db.doc("config/relay").get(),
     ]);
     if (!teamSnap.exists) throw new ApiError(404, "no-team");
-    const team = teamSnap.data() as Team;
+    let team = teamSnap.data() as Team;
     const cfg = cfgSnap.data() as Cfg | undefined;
 
     if (team.uid !== user.uid) throw new ApiError(403, "not-your-team");
@@ -91,8 +109,28 @@ export async function POST(req: Request) {
     }
     const now = Date.now();
 
+    // Gives a team its own question order when it has none (for example a team that
+    // was added after the round started). Safe to call many times.
+    async function ensureOrder(): Promise<void> {
+      const bank = await getBank();
+      const order = buildOrder(bank);
+      if (order.length === 0) throw new ApiError(500, "bank-not-ready");
+      await db.runTransaction(async (tx) => {
+        const cur = (await tx.get(teamRef)).data() as Team;
+        if (cur.order?.length) return;
+        tx.update(teamRef, {
+          order,
+          qIndex: 0,
+          holder: cur.holder ?? 0,
+          memberCounts: cur.memberNames.map(() => 0),
+        });
+      });
+      team = (await teamRef.get()).data() as Team;
+    }
+
     // ---------- begin: the team accepted the instructions, its own clock starts now ----------
     if (action === "begin") {
+      if (!team.order?.length) await ensureOrder();
       await db.runTransaction(async (tx) => {
         const cur = (await tx.get(teamRef)).data() as Team;
         if (cur.startedAt) return; // already started (double click / reload)
@@ -123,7 +161,6 @@ export async function POST(req: Request) {
     const counts = countsOf(team);
     const holderFull = (counts[team.holder] ?? 0) >= cap;
 
-    const qid = team.order[team.qIndex];
     const legStart = (team.legStartedAt?.toMillis() ?? now) + pending;
     const inHandoff = !!team.handoffSince; // baton is waiting for the next member
 
@@ -250,6 +287,10 @@ export async function POST(req: Request) {
     }
 
     // ---------- question / tests ----------
+    // A team with no question order (added after the round started) gets one now.
+    if (!team.order?.length) await ensureOrder();
+
+    const qid = team.order[team.qIndex];
     if (!qid) throw new ApiError(409, "no-question");
     const bank = await getBank();
     const q = bank.find((x) => x.id === qid);
@@ -352,6 +393,13 @@ export async function POST(req: Request) {
           solvedIds: FieldValue.arrayUnion(qid),
           qIndex: cur.qIndex + 1,
           lastSolveAt: Timestamp.fromMillis(now),
+          // Active time on this team's own clock: from ITS start, minus paused time
+          // (judging pauses and baton handoffs). The judging pause began when the
+          // team pressed Check/Submit, so that is the moment the answer was given.
+          lastSolveElapsedMs: Math.max(
+            0,
+            pause.toMillis() - (cur.startedAt?.toMillis() ?? now) - (cur.bonusMs ?? 0)
+          ),
           status: done ? "finished" : "active",
         });
         return done;
