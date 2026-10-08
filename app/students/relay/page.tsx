@@ -98,6 +98,8 @@ export default function RelayPage() {
   const [busy, setBusy] = useState<Busy>("");
   const [notice, setNotice] = useState<{ kind: "ok" | "bad"; text: string } | null>(null);
   const [retry, setRetry] = useState(0);
+  const [qError, setQError] = useState<string | null>(null); // why the question did not load
+  const [qTry, setQTry] = useState(0); // bump to load the question again
   const [awaitNext, setAwaitNext] = useState(false); // waiting for the next question to show
   const [confirmSkip, setConfirmSkip] = useState(false);
   const [confirmEnd, setConfirmEnd] = useState(false);
@@ -238,15 +240,19 @@ export default function RelayPage() {
   const nextName = team && !isLast ? team.memberNames[team.holder + 1] : "";
 
   // ---------- question ----------
+  // Loads the current question. If the request fails it shows why and tries again
+  // by itself, so a student is never left on a silent spinner.
   useEffect(() => {
     if (!arena || !teamId) return;
     let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     api<{ question: PublicQuestion; index: number; total: number }>("/api/relay", {
       action: "question",
       teamId,
     })
       .then((r) => {
         if (!alive) return;
+        setQError(null);
         setQuestion({ ...r.question, index: r.index, total: r.total });
         setInputText(r.question.sampleInput);
         setRunOut(null);
@@ -260,11 +266,16 @@ export default function RelayPage() {
           });
         }
       })
-      .catch(() => {});
+      .catch((e) => {
+        if (!alive) return;
+        setQError((e as Error)?.message || "unknown-error");
+        timer = setTimeout(() => setQTry((n) => n + 1), 3000);
+      });
     return () => {
       alive = false;
+      if (timer) clearTimeout(timer);
     };
-  }, [arena, teamId, team?.qIndex, cfg?.roundId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [arena, teamId, team?.qIndex, cfg?.roundId, qTry]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // the code lives in this browser only (survives a reload), never in the database
   const storeKey =
@@ -695,10 +706,31 @@ export default function RelayPage() {
       </div>
     );
   } else if (!question) {
+    const friendly: Record<string, string> = {
+      "no-question": "Your team has no question assigned yet.",
+      "question-missing": "Your question is missing from the bank.",
+      "bank-not-ready": "The question outputs have not been computed yet.",
+      "round-not-running": "The round is not running.",
+      "not-begun": "Your team has not started the relay.",
+    };
     body = (
       <div className="flex flex-col items-center gap-3 py-24 text-sm text-slate-600">
-        <Spinner />
-        Loading your question…
+        {qError ? (
+          <>
+            <p className="max-w-md text-center font-medium text-red-700">
+              Could not load your question. {friendly[qError] ?? qError}
+            </p>
+            <p>Trying again automatically. If this stays, tell an organiser.</p>
+            <button className={btnGhost} onClick={() => setQTry((n) => n + 1)}>
+              Retry now
+            </button>
+          </>
+        ) : (
+          <>
+            <Spinner />
+            Loading your question…
+          </>
+        )}
       </div>
     );
   } else {
